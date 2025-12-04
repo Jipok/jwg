@@ -271,6 +271,9 @@ func main() {
 			} else if d.PrivateKey != config.PrivateKey {
 				fmt.Printf("%s[CONF]%s Live private key mismatches database.\n", colorYellow, colorReset)
 				mutatingAction = true
+			} else if len(d.Peers) != peerDataMap.Size() {
+				fmt.Printf("%s[CONF]%s Live peer count (%d) mismatches database (%d).\n", colorYellow, colorReset, len(d.Peers), peerDataMap.Size())
+				mutatingAction = true
 			}
 		}
 	}
