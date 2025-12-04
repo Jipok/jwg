@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -828,6 +829,27 @@ func runShowInfo() {
 		if len(d.Peers) == 0 {
 			fmt.Printf("  %sPeers%s: (none)\n", colorBold, colorReset)
 		} else {
+			// Sort peers by Name alphabetically
+			sort.Slice(d.Peers, func(i, j int) bool {
+				nameI, okI := publicKeyToName[d.Peers[i].PublicKey]
+				nameJ, okJ := publicKeyToName[d.Peers[j].PublicKey]
+
+				// If name not found (unmanaged peer), push to the end
+				if !okI && okJ {
+					return false
+				}
+				if okI && !okJ {
+					return true
+				}
+				if !okI && !okJ {
+					// Both unknown, sort by public key
+					return d.Peers[i].PublicKey.String() < d.Peers[j].PublicKey.String()
+				}
+
+				// Standard alphabet sort
+				return nameI < nameJ
+			})
+
 			fmt.Printf("  %sPeers (%d):%s\n", colorBold, len(d.Peers), colorReset)
 			for _, p := range d.Peers {
 				// Pass the lookup map to the print function
