@@ -277,7 +277,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to auto-detect public IP and -endpoint flag not provided: %v", err)
 		}
-		config.Endpoint = fmt.Sprintf("%s:%d", publicIP, argPort)
+		config.Endpoint = net.JoinHostPort(publicIP, fmt.Sprintf("%d", argPort))
 		configDirty = true
 		fmt.Printf("%s[OK]%s Detected and using new endpoint: %s%s%s\n", colorGreen, colorReset, colorBold, config.Endpoint, colorReset)
 	}
@@ -325,8 +325,6 @@ func main() {
 
 		fmt.Printf("%s[OK]%s Firewall rules updated for port %d.\n", colorGreen, colorReset, argPort)
 		mutatingAction = true // Force WG sync to bind to new port
-	} else {
-		fmt.Printf("%s[OK]%s Network configuration (IP & NAT) appears to be in place. Skipping setup.\n", colorGreen, colorReset)
 	}
 
 	// Safety check: even if user didn't ask to add/del peer, and IP is set,
@@ -618,58 +616,67 @@ func runCmd(name string, args ...string) error {
 
 // detectPublicIP finds the server's public IP address using an external service.
 func detectPublicIP() (string, error) {
-	// A list of services to try.
+	// A list of services to try
 	services := []string{
 		"https://ifconfig.co",
 		"https://ifconfig.me/ip",
 		"https://icanhazip.com",
+		"https://api.ipify.org",
 	}
 
-	fmt.Printf("%s[INFO]%s Detecting public IP by querying external services...\n", colorCyan, colorReset)
+	fmt.Printf("%s[INFO]%s Detecting public IP (IPv4 only) by querying external services...\n", colorCyan, colorReset)
 
-	// Iterate over the services.
+	// Create a custom Transport that forces IPv4
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
+
+	// Iterate over the services
 	for _, service := range services {
-		// Create an HTTP client with a reasonable timeout for each attempt.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
-		req, err := http.NewRequestWithContext(ctx, "GET", service, nil)
+		req, err := http.NewRequestWithContext(context.Background(), "GET", service, nil)
 		if err != nil {
-			cancel()
-			// Log error and try the next service.
 			fmt.Printf("    - error creating request for %s: %v\n", service, err)
 			continue
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
-			cancel()
 			fmt.Printf("    - failed to get public IP from %s: %v\n", service, err)
 			continue
 		}
 
-		// Check status code.
+		// Check status code
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			cancel()
 			fmt.Printf("    - bad status code from %s: %d\n", service, resp.StatusCode)
 			continue
 		}
 
-		// Read the response body.
+		// Read the response body
 		ipBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close() // Close body right after reading.
+		resp.Body.Close()
 		if err != nil {
-			cancel()
 			fmt.Printf("    - failed to read response body from %s: %v\n", service, err)
 			continue
 		}
 
-		cancel() // We are done with this context.
-		// If we got here, we have a valid IP.
-		return strings.TrimSpace(string(ipBytes)), nil
+		ipStr := strings.TrimSpace(string(ipBytes))
+
+		// Ensure it really looks like an IPv4
+		if net.ParseIP(ipStr).To4() == nil {
+			fmt.Printf("    - response from %s was not a valid IPv4: %s\n", service, ipStr)
+			continue
+		}
+
+		return ipStr, nil
 	}
 
-	// If the loop completes, all services have failed.
 	return "", fmt.Errorf("all public IP detection services failed")
 }
 
