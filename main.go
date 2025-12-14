@@ -730,11 +730,7 @@ func runAddPeer(peerName string) {
 	}
 
 	// --- 1. Get Server's Public Key for client config ---
-	serverDevice, err := wgClient.Device(argIface)
-	if err != nil {
-		log.Fatalf("failed to get device '%s' to retrieve server public key: %v. Is the interface up?", argIface, err)
-	}
-	serverPublicKey := serverDevice.PublicKey
+	serverPublicKey := config.PrivateKey.PublicKey()
 
 	// --- 2. Generate keys for the new peer ---
 	peerPrivateKey, err := wgtypes.GeneratePrivateKey()
