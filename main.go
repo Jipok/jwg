@@ -142,6 +142,8 @@ func main() {
 
 	// Flag to track if we need to save updates to the DB
 	configDirty := false
+	// Flag to track if we need to re-apply firewall rules (port or nat-iface changed)
+	firewallDirty := false
 
 	if err == persist.ErrKeyNotFound {
 		fmt.Printf("%s[INFO]%s Server config not found. Generating a new one...\n", colorCyan, colorReset)
@@ -154,7 +156,7 @@ func main() {
 	}
 
 	// --- Configuration Normalization Logic ---
-	// 1. Apply defaults to the Config struct if fields are empty (fresh install)
+	// Apply defaults to the Config struct if fields are empty (fresh install)
 	if config.Interface == "" {
 		config.Interface = defaultIface
 	}
@@ -167,26 +169,42 @@ func main() {
 	if config.DNS == "" {
 		config.DNS = defaultDNS
 	}
-	// Note: NatIface/Endpoint is left empty if not set, to allow auto-detection later if needed.
 
-	// 2. Apply Command Line Flags overrides
-	// FIX: We check if the flag was explicitly passed by the user, regardless of its value.
+	// Apply Command Line Flags overrides
+	// We check if the flag was explicitly passed by the user, regardless of its value.
 	// This allows users to revert settings to default values (e.g. -port 31797).
 	if isFlagPassed("iface") {
 		config.Interface = argIface
 		configDirty = true
 	}
 	if isFlagPassed("port") {
+		if config.Port != argPort {
+			fmt.Printf("%s[WARN]%s Port changed from %d to %d. Existing clients will lose connection until their config is updated.\n", colorYellow, colorReset, config.Port, argPort)
+			firewallDirty = true
+		}
 		config.Port = argPort
 		configDirty = true
+
+		// Update Endpoint string automatically if port changes
+		if config.Endpoint != "" {
+			host, _, err := net.SplitHostPort(config.Endpoint)
+			if err == nil {
+				newEndpoint := net.JoinHostPort(host, fmt.Sprintf("%d", argPort))
+				if config.Endpoint != newEndpoint {
+					config.Endpoint = newEndpoint
+				}
+			}
+		}
 	}
 	if isFlagPassed("subnet") {
 		config.Subnet = argSubnet
 		configDirty = true
+		firewallDirty = true
 	}
 	if isFlagPassed("nat-iface") {
 		config.NatIface = argNatIface
 		configDirty = true
+		firewallDirty = true
 	}
 	if isFlagPassed("dns") {
 		config.DNS = argDNS
@@ -198,8 +216,7 @@ func main() {
 		fmt.Printf("%s[OK]%s Manual endpoint set via flag: %s%s%s\n", colorGreen, colorReset, colorBold, config.Endpoint, colorReset)
 	}
 
-	// 3. Sync "Global Args" with "Config State"
-	// The rest of the application uses 'argVar' variables, so we ensure they match the persisted config.
+	// Sync "Global Args" with "Config State"
 	argIface = config.Interface
 	argPort = config.Port
 	argSubnet = config.Subnet
@@ -219,7 +236,15 @@ func main() {
 	}
 	defer wgClient.Close()
 
-	// 6. Auto-detect Endpoint if config is empty AND flag wasn't passed.
+	// Ensure we have a valid NAT interface before configuring firewall
+	if argNatIface == "" {
+		detectedIface, err := detectDefaultInterface()
+		if err == nil {
+			argNatIface = detectedIface
+		}
+	}
+
+	// Auto-detect Endpoint if still empty
 	if config.Endpoint == "" {
 		publicIP, err := detectPublicIP()
 		if err != nil {
@@ -238,27 +263,41 @@ func main() {
 	}
 
 	// --- Action Router ---
-	// Read-only actions that don't need a full sync can run here and exit early.
 	if argShowPeer != "" {
 		runShowPeer(argShowPeer)
 		return
 	}
-	// The main logic will then sync it to the live interface.
 	if argAddPeer != "" {
 		runAddPeer(argAddPeer)
 	}
 	if argDelPeer != "" {
 		runDelPeer(argDelPeer)
 	}
-	// Determine if a mutating action is being performed.
+
 	mutatingAction := argAddPeer != "" || argDelPeer != ""
 
-	// Check if network setup (IP, NAT rules) is needed.
+	// Check environment and configure firewall/interfaces
 	if !isInterfaceConfigured(argIface, argSubnet) {
 		fmt.Printf("%s[WARN]%s Interface %s is not configured with IP %s. Running initial network setup...\n", colorYellow, colorReset, argIface, argSubnet)
+		// This runs full setup: IP assignment + UP + Firewall
 		runInitialNetworkSetup()
-		// Force sync because a fresh interface usually has random port/no keys.
 		mutatingAction = true
+	} else if firewallDirty {
+		// Interface is UP, but port or NAT settings configuration changed via flags.
+		fmt.Printf("%s[CONF]%s Configuration changed (Port/Subnet/NAT). Updating firewall rules...\n", colorYellow, colorReset)
+
+		if argNatIface == "" {
+			log.Fatalf("NAT interface could not be auto-detected. Please use -nat-iface.")
+		}
+
+		// Re-apply firewall rules
+		if err := applyNftablesRules(argSubnet, argIface, argNatIface); err != nil {
+			log.Fatalf("Failed to apply nftables configuration: %v", err)
+		}
+		checkAndConfigureUFW(argPort, argIface, argNatIface)
+
+		fmt.Printf("%s[OK]%s Firewall rules updated for port %d.\n", colorGreen, colorReset, argPort)
+		mutatingAction = true // Force WG sync to bind to new port
 	} else {
 		fmt.Printf("%s[OK]%s Network configuration (IP & NAT) appears to be in place. Skipping setup.\n", colorGreen, colorReset)
 	}
@@ -388,7 +427,6 @@ func isInterfaceConfigured(ifaceName, expectedAddr string) bool {
 	return false
 }
 
-// Replace the old runInitialNetworkSetup with this generic dispatch
 func runInitialNetworkSetup() {
 	// Detect default interface
 	if argNatIface == "" {
@@ -434,9 +472,6 @@ func runInitialNetworkSetup() {
 
 	checkAndConfigureUFW(argPort, argIface, argNatIface)
 }
-
-// Remove ensureIPTablesRule entirely.
-// Add applyNftablesRules instead.
 
 // applyNftablesRules creates a dedicated table 'jwg' to handle WG traffic.
 // Included hooks:
@@ -963,70 +998,3 @@ func isFlagPassed(name string) bool {
 	})
 	return found
 }
-
-// // It checks if a rule exists and adds it if not
-// func ensureIPTablesRule(table, chain string, ruleSpec ...string) error {
-// 	// Use -C/--check to see if the rule exists.
-// 	checkArgs := append([]string{"-t", table, "-C", chain}, ruleSpec...)
-// 	if exec.Command("iptables", checkArgs...).Run() != nil {
-// 		fmt.Printf("    - Rule not found in %s/%s. Adding: %s%s%s\n", table, chain, colorBold, strings.Join(ruleSpec, " "), colorReset)
-// 		// Use -I/--insert to add the rule at the top of the chain to ensure it's evaluated.
-// 		insertArgs := append([]string{"-t", table, "-I", chain}, ruleSpec...)
-// 		if err := runCmd("iptables", insertArgs...); err != nil {
-// 			return fmt.Errorf("failed to insert iptables rule: %w", err)
-// 		}
-// 	} else {
-// 		fmt.Printf("    - Rule already exists in %s/%s. Skipping.\n", table, chain)
-// 	}
-// 	return nil
-// }
-
-// // runInitialNetworkSetup performs the one-time setup of the network interface,
-// // including setting the IP, bringing it up, and configuring NAT rules.
-// // This is idempotent and safe to run multiple times.
-// func runInitialNetworkSetup() {
-// 	// NOTE: This is the body of the old runInitServer, minus wg-specific parts.
-
-// 	// Step 1: Assign IP address to the interface
-// 	// Flush any old IPs first for a clean state.
-// 	runCmd("ip", "addr", "flush", "dev", argIface)
-// 	if err := runCmd("ip", "address", "add", argSubnet, "dev", argIface); err != nil {
-// 		log.Fatalf("Failed to assign IP address %s to %s: %v", argSubnet, argIface, err)
-// 	}
-// 	fmt.Printf("  %s[OK]%s Assigned IP %s to interface %s.\n", colorGreen, colorReset, argSubnet, argIface)
-
-// 	// Step 2: Bring the interface UP
-// 	if err := runCmd("ip", "link", "set", "up", "dev", argIface); err != nil {
-// 		log.Fatalf("Failed to bring up interface %s: %v", argIface, err)
-// 	}
-// 	fmt.Printf("  %s[OK]%s Interface %s is now UP.\n", colorGreen, colorReset, argIface)
-
-// 	// Step 3: Enable IP forwarding in the kernel.
-// 	fmt.Printf("  %s[SETUP]%s Enabling kernel IP forwarding...\n", colorCyan, colorReset)
-// 	if err := runCmd("sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
-// 		fmt.Printf("%s[WARN]%s Failed to enable IP forwarding via sysctl: %v\n", colorYellow, colorReset, err)
-// 	} else {
-// 		fmt.Printf("    %s[OK]%s IP forwarding enabled for the current session.\n", colorGreen, colorReset)
-// 	}
-
-// 	// Step 4: Set up NAT using the new idempotent helper.
-// 	fmt.Printf("  %s[FIREWALL]%s Configuring NAT for %s -> %s...\n", colorYellow, colorReset, argIface, argNatIface)
-
-// 	// NAT MASQUERADE Rule
-// 	natRule := []string{"-s", argSubnet, "-o", argNatIface, "-j", "MASQUERADE"}
-// 	if err := ensureIPTablesRule("nat", "POSTROUTING", natRule...); err != nil {
-// 		log.Fatalf("Failed to configure NAT rule: %v", err)
-// 	}
-
-// 	// FORWARDING Rule 1: Allow traffic from WG to public NAT interface.
-// 	fwdRule1 := []string{"-i", argIface, "-o", argNatIface, "-j", "ACCEPT"}
-// 	if err := ensureIPTablesRule("filter", "FORWARD", fwdRule1...); err != nil {
-// 		log.Fatalf("Failed to configure forwarding rule 1: %v", err)
-// 	}
-
-// 	// FORWARDING Rule 2: Allow established and related traffic back.
-// 	fwdRule2 := []string{"-i", argNatIface, "-o", argIface, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
-// 	if err := ensureIPTablesRule("filter", "FORWARD", fwdRule2...); err != nil {
-// 		log.Fatalf("Failed to configure forwarding rule 2: %v", err)
-// 	}
-// }
