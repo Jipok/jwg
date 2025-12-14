@@ -64,6 +64,8 @@ type Device struct {
 	// take action on outgoing WireGuard packets.
 	FirewallMark int
 
+	IsAmnezia bool
+
 	// Peers is the list of network peers associated with this device.
 	Peers []Peer
 }
@@ -229,6 +231,35 @@ type Config struct {
 
 	// Peers specifies a list of peer configurations to apply to a device.
 	Peers []PeerConfig
+
+	// --- AmneziaWG Specific Configuration ---
+	// All fields are pointers to handle "optional update" semantics.
+
+	// Junk Packet parameters
+	JunkPacketCount   *int // jc
+	JunkPacketMinSize *int // jmin
+	JunkPacketMaxSize *int // jmax
+
+	// Message Padding parameters (bytes)
+	InitPadding      *int // s1
+	ResponsePadding  *int // s2
+	CookiePadding    *int // s3
+	TransportPadding *int // s4
+
+	// Message Magic Headers
+	// In AmneziaWG these can be ranges ("123-456") or single values. Hence string.
+	InitHeader      *string // h1
+	ResponseHeader  *string // h2
+	CookieHeader    *string // h3
+	TransportHeader *string // h4
+
+	// Init Packet Magic / Custom Signature (obfuscation)
+	// e.g. i1="<b 0x...>..."
+	InitPacket1 *string // i1
+	InitPacket2 *string // i2
+	InitPacket3 *string // i3
+	InitPacket4 *string // i4
+	InitPacket5 *string // i5
 }
 
 // TODO(mdlayher): consider adding ProtocolVersion in PeerConfig.

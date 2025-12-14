@@ -47,6 +47,11 @@ func (c *Client) Devices() ([]*wgtypes.Device, error) {
 			return nil, err
 		}
 
+		// Check if the socket path indicates an AmneziaWG device.
+		if strings.Contains(d, "amneziawg") {
+			wgd.IsAmnezia = true
+		}
+
 		wgds = append(wgds, wgd)
 	}
 
@@ -65,7 +70,17 @@ func (c *Client) Device(name string) (*wgtypes.Device, error) {
 			continue
 		}
 
-		return c.getDevice(d)
+		wgd, err := c.getDevice(d)
+		if err != nil {
+			return nil, err
+		}
+
+		// Check if the socket path indicates an AmneziaWG device.
+		if strings.Contains(d, "amneziawg") {
+			wgd.IsAmnezia = true
+		}
+
+		return wgd, nil
 	}
 
 	return nil, os.ErrNotExist

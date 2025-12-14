@@ -63,6 +63,66 @@ func writeConfig(w io.Writer, cfg wgtypes.Config) {
 		fmt.Fprintf(w, "fwmark=%d\n", *cfg.FirewallMark)
 	}
 
+	// --- AmneziaWG Parameters Start ---
+
+	// Junk Packets
+	if cfg.JunkPacketCount != nil {
+		fmt.Fprintf(w, "jc=%d\n", *cfg.JunkPacketCount)
+	}
+	if cfg.JunkPacketMinSize != nil {
+		fmt.Fprintf(w, "jmin=%d\n", *cfg.JunkPacketMinSize)
+	}
+	if cfg.JunkPacketMaxSize != nil {
+		fmt.Fprintf(w, "jmax=%d\n", *cfg.JunkPacketMaxSize)
+	}
+
+	// Padding
+	if cfg.InitPadding != nil {
+		fmt.Fprintf(w, "s1=%d\n", *cfg.InitPadding)
+	}
+	if cfg.ResponsePadding != nil {
+		fmt.Fprintf(w, "s2=%d\n", *cfg.ResponsePadding)
+	}
+	if cfg.CookiePadding != nil {
+		fmt.Fprintf(w, "s3=%d\n", *cfg.CookiePadding)
+	}
+	if cfg.TransportPadding != nil {
+		fmt.Fprintf(w, "s4=%d\n", *cfg.TransportPadding)
+	}
+
+	// Headers (passed as strings because they can be ranges "123-456")
+	if cfg.InitHeader != nil {
+		fmt.Fprintf(w, "h1=%s\n", *cfg.InitHeader) // h1 -> Init
+	}
+	if cfg.ResponseHeader != nil {
+		fmt.Fprintf(w, "h2=%s\n", *cfg.ResponseHeader) // h2 -> Response
+	}
+	if cfg.CookieHeader != nil {
+		fmt.Fprintf(w, "h3=%s\n", *cfg.CookieHeader) // h3 -> Cookie
+	}
+	if cfg.TransportHeader != nil {
+		fmt.Fprintf(w, "h4=%s\n", *cfg.TransportHeader) // h4 -> Transport
+	}
+
+	// Init Custom Packets ("Custom signature packets")
+	if cfg.InitPacket1 != nil {
+		fmt.Fprintf(w, "i1=%s\n", *cfg.InitPacket1)
+	}
+	if cfg.InitPacket2 != nil {
+		fmt.Fprintf(w, "i2=%s\n", *cfg.InitPacket2)
+	}
+	if cfg.InitPacket3 != nil {
+		fmt.Fprintf(w, "i3=%s\n", *cfg.InitPacket3)
+	}
+	if cfg.InitPacket4 != nil {
+		fmt.Fprintf(w, "i4=%s\n", *cfg.InitPacket4)
+	}
+	if cfg.InitPacket5 != nil {
+		fmt.Fprintf(w, "i5=%s\n", *cfg.InitPacket5)
+	}
+
+	// --- AmneziaWG Parameters End ---
+
 	if cfg.ReplacePeers {
 		fmt.Fprintln(w, "replace_peers=true")
 	}

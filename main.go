@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -78,6 +79,18 @@ type ServerConfig struct {
 	NatIface   string
 	DNS        string
 	Interface  string
+
+	// --- AmneziaWG Specific Params ---
+	// If 0 or empty, they are considered unset.
+	AmnezJc   int    // JunkPacketCount
+	AmnezJmin int    // JunkPacketMinSize
+	AmnezJmax int    // JunkPacketMaxSize
+	AmnezS1   int    // InitPadding
+	AmnezS2   int    // ResponsePadding
+	AmnezH1   string // InitHeader (magic)
+	AmnezH2   string // ResponseHeader (magic)
+	AmnezH3   string // CookieHeader (magic)
+	AmnezH4   string // TransportHeader (magic)
 }
 
 // PeerData holds all necessary information about a peer, including its
@@ -236,6 +249,20 @@ func main() {
 	}
 	defer wgClient.Close()
 
+	// --- AMNEZIA DETECTION & CONFIG ---
+	isAmneziaDevice := false
+	if d, err := wgClient.Device(argIface); err == nil {
+		if d.IsAmnezia {
+			isAmneziaDevice = true
+			// Check if we need to generate params
+			if config.AmnezJc == 0 || config.AmnezH1 == "" {
+				fmt.Printf("%s[AMNEZIA]%s Detected AmneziaWG interface. Generating obfuscation parameters...\n", colorPurple, colorReset)
+				generateAmneziaParams(&config)
+				configDirty = true
+			}
+		}
+	}
+
 	// Ensure we have a valid NAT interface before configuring firewall
 	if argNatIface == "" {
 		detectedIface, err := detectDefaultInterface()
@@ -340,6 +367,23 @@ func main() {
 			Peers:        allPeers,
 		}
 
+		// Apply Amnezia-specific parameters only if the device supports it
+		if isAmneziaDevice {
+			fmt.Printf("  %s[AMNEZIA]%s Applying obfuscation parameters (Jc=%d, H1=%s...)\n", colorPurple, colorReset, config.AmnezJc, config.AmnezH1)
+
+			configWg.JunkPacketCount = intPtr(config.AmnezJc)
+			configWg.JunkPacketMinSize = intPtr(config.AmnezJmin)
+			configWg.JunkPacketMaxSize = intPtr(config.AmnezJmax)
+			configWg.InitPadding = intPtr(config.AmnezS1)
+			configWg.ResponsePadding = intPtr(config.AmnezS2)
+
+			// Headers
+			configWg.InitHeader = strPtr(config.AmnezH1)
+			configWg.ResponseHeader = strPtr(config.AmnezH2)
+			configWg.CookieHeader = strPtr(config.AmnezH3)
+			configWg.TransportHeader = strPtr(config.AmnezH4)
+		}
+
 		if err := wgClient.ConfigureDevice(argIface, configWg); err != nil {
 			log.Fatalf("Failed to configure WireGuard device: %v", err)
 		}
@@ -348,9 +392,7 @@ func main() {
 
 	// Only show final state if not just adding a peer
 	if argAddPeer == "" && argDelPeer == "" {
-		fmt.Printf("\n%s%s----------------- Live State ------------------%s\n", colorBlue, colorBold, colorReset)
 		runShowInfo()
-		fmt.Printf("\n%s[DONE]%s Sync complete.\n", colorGreen, colorReset)
 	}
 }
 
@@ -804,10 +846,25 @@ func printClientConfig(peerName string, peerData PeerData, serverPublicKey wgtyp
 	}
 	psk := peerData.Config.PresharedKey.String()
 
+	// Check if we have Amnezia params in the global config.
+	// Values > 0 imply they are set.
+	var amneziaParamsBuilder strings.Builder
+	if config.AmnezJc > 0 {
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("\nJc = %d\n", config.AmnezJc))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("Jmin = %d\n", config.AmnezJmin))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("Jmax = %d\n", config.AmnezJmax))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("S1 = %d\n", config.AmnezS1))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("S2 = %d\n", config.AmnezS2))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("H1 = %s\n", config.AmnezH1))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("H2 = %s\n", config.AmnezH2))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("H3 = %s\n", config.AmnezH3))
+		amneziaParamsBuilder.WriteString(fmt.Sprintf("H4 = %s\n", config.AmnezH4))
+	}
+
 	clientConfig := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s
-DNS = %s
+DNS = %s%s
 
 [Peer]
 PublicKey = %s
@@ -819,6 +876,7 @@ PersistentKeepalive = 25
 		peerData.PrivateKey.String(),
 		peerIP,
 		config.DNS,
+		amneziaParamsBuilder.String(),
 		serverPublicKey.String(),
 		psk,
 		config.Endpoint,
@@ -848,8 +906,7 @@ func runShowInfo() {
 	})
 
 	// ---- Live Device Info ----
-	fmt.Println("🔎 Live Configuration (from wgctrl)")
-	fmt.Println("====================================")
+	fmt.Println("\n====================================")
 	// We query for the specific device from the flag, not all devices.
 	d, err := wgClient.Device(argIface)
 	if err != nil {
@@ -910,7 +967,13 @@ func runDelPeer(peerName string) {
 
 // printDeviceDetails prints all available fields for a wgtypes.Device.
 func printDeviceDetails(d *wgtypes.Device) {
-	fmt.Printf("%sInterface:%s %s%s (%s)%s\n", colorBold, colorReset, colorGreen, d.Name, d.Type.String(), colorReset)
+	// Build interface type string with Amnezia tag if detected
+	typeStr := d.Type.String()
+	if d.IsAmnezia {
+		typeStr += fmt.Sprintf(" %sAmnezia%s", colorPurple, colorGreen)
+	}
+
+	fmt.Printf("%sInterface:%s %s%s (%s)%s\n", colorBold, colorReset, colorGreen, d.Name, typeStr, colorReset)
 
 	// Helper for formatted key-value printing
 	printInfo := func(key, value string) {
@@ -993,4 +1056,37 @@ func isFlagPassed(name string) bool {
 		}
 	})
 	return found
+}
+
+// generateAmneziaParams populates the config with random obfuscation values
+// math/rand is enough for obfuscation, not crypto params
+func generateAmneziaParams(cfg *ServerConfig) {
+	// Seed random generator (Not strictly crypto-secure, but fine for obfuscation)
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// 1. Junk Packets (Recommended: Jc 4-12, Jmin < Jmax)
+	cfg.AmnezJc = 5 + r.Intn(10)                     // 5 to 14 packets
+	cfg.AmnezJmin = 40 + r.Intn(20)                  // 40-60 bytes
+	cfg.AmnezJmax = cfg.AmnezJmin + 50 + r.Intn(100) // Jmin + 50-150 bytes
+
+	// 2. Payload Padding
+	cfg.AmnezS1 = 150 + r.Intn(100) // Init padding
+	cfg.AmnezS2 = 150 + r.Intn(100) // Response padding
+
+	// 3. Magic Headers (H1-H4) - simulating uint32 identifiers
+	// Using range roughly covering 32-bit integers but avoiding very small numbers
+	cfg.AmnezH1 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
+	cfg.AmnezH2 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
+	cfg.AmnezH3 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
+	cfg.AmnezH4 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
+}
+
+// intPtr is a helper to get a pointer to an int generic literal
+func intPtr(i int) *int {
+	return &i
+}
+
+// strPtr is a helper to get a pointer to a string literal
+func strPtr(s string) *string {
+	return &s
 }
