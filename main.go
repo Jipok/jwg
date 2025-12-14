@@ -118,18 +118,6 @@ func main() {
 		log.Fatalf("The -ip flag can only be used when adding a new peer with the -add flag.")
 	}
 
-	if _, err := net.InterfaceByName(argIface); err != nil {
-		printMissingInterfaceHelp(argIface)
-		os.Exit(1)
-	}
-
-	// WG Client Setup
-	wgClient, err = wgctrl.New()
-	if err != nil {
-		log.Fatalf("failed to open wgctrl: %v", err)
-	}
-	defer wgClient.Close()
-
 	// --- Persistence/Config ---
 	store = persist.New()
 
@@ -217,6 +205,19 @@ func main() {
 	argSubnet = config.Subnet
 	argNatIface = config.NatIface
 	argDNS = config.DNS
+
+	// Interface validation
+	if _, err := net.InterfaceByName(argIface); err != nil {
+		printMissingInterfaceHelp(argIface)
+		os.Exit(1)
+	}
+
+	// WG Client Setup
+	wgClient, err = wgctrl.New()
+	if err != nil {
+		log.Fatalf("failed to open wgctrl: %v", err)
+	}
+	defer wgClient.Close()
 
 	// 6. Auto-detect Endpoint if config is empty AND flag wasn't passed.
 	if config.Endpoint == "" {
