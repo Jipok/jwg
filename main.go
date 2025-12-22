@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -18,9 +17,9 @@ import (
 	"time"
 
 	"github.com/Jipok/go-persist"
+	"github.com/Jipok/wgctrl-go"
+	"github.com/Jipok/wgctrl-go/wgtypes"
 	"github.com/skip2/go-qrcode"
-	"golang.zx2c4.com/wireguard/wgctrl"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 const (
@@ -87,6 +86,8 @@ type ServerConfig struct {
 	AmnezJmax int    // JunkPacketMaxSize
 	AmnezS1   int    // InitPadding
 	AmnezS2   int    // ResponsePadding
+	AmnezS3   int    // CookiePadding
+	AmnezS4   int    // TransportPadding
 	AmnezH1   string // InitHeader (magic)
 	AmnezH2   string // ResponseHeader (magic)
 	AmnezH3   string // CookieHeader (magic)
@@ -254,10 +255,51 @@ func main() {
 	if d, err := wgClient.Device(argIface); err == nil {
 		if d.IsAmnezia {
 			isAmneziaDevice = true
-			// Check if we need to generate params
+			// Check if we need to generate params. Use Local Store values to check existence.
 			if config.AmnezJc == 0 || config.AmnezH1 == "" {
 				fmt.Printf("%s[AMNEZIA]%s Detected AmneziaWG interface. Generating obfuscation parameters...\n", colorPurple, colorReset)
-				generateAmneziaParams(&config)
+
+				// Create a temporary config to utilize the library's generation logic
+				var tempWgCfg wgtypes.Config
+				tempWgCfg.GenerateAmneziaParams()
+
+				// Map generated values back to persistent ServerConfig
+				if tempWgCfg.Jc != nil {
+					config.AmnezJc = *tempWgCfg.Jc
+				}
+				if tempWgCfg.Jmin != nil {
+					config.AmnezJmin = *tempWgCfg.Jmin
+				}
+				if tempWgCfg.Jmax != nil {
+					config.AmnezJmax = *tempWgCfg.Jmax
+				}
+
+				if tempWgCfg.S1 != nil {
+					config.AmnezS1 = *tempWgCfg.S1
+				}
+				if tempWgCfg.S2 != nil {
+					config.AmnezS2 = *tempWgCfg.S2
+				}
+				if tempWgCfg.S3 != nil {
+					config.AmnezS3 = *tempWgCfg.S3
+				}
+				if tempWgCfg.S4 != nil {
+					config.AmnezS4 = *tempWgCfg.S4
+				}
+
+				if tempWgCfg.H1 != nil {
+					config.AmnezH1 = *tempWgCfg.H1
+				}
+				if tempWgCfg.H2 != nil {
+					config.AmnezH2 = *tempWgCfg.H2
+				}
+				if tempWgCfg.H3 != nil {
+					config.AmnezH3 = *tempWgCfg.H3
+				}
+				if tempWgCfg.H4 != nil {
+					config.AmnezH4 = *tempWgCfg.H4
+				}
+
 				configDirty = true
 			}
 		}
@@ -361,7 +403,7 @@ func main() {
 		configWg := wgtypes.Config{
 			PrivateKey:   &config.PrivateKey,
 			ListenPort:   &argPort,
-			ReplacePeers: true, // This is key: it makes the configuration idempotent.
+			ReplacePeers: true,
 			Peers:        allPeers,
 		}
 
@@ -369,17 +411,19 @@ func main() {
 		if isAmneziaDevice {
 			fmt.Printf("  %s[AMNEZIA]%s Applying obfuscation parameters (Jc=%d, H1=%s...)\n", colorPurple, colorReset, config.AmnezJc, config.AmnezH1)
 
-			configWg.JunkPacketCount = intPtr(config.AmnezJc)
-			configWg.JunkPacketMinSize = intPtr(config.AmnezJmin)
-			configWg.JunkPacketMaxSize = intPtr(config.AmnezJmax)
-			configWg.InitPadding = intPtr(config.AmnezS1)
-			configWg.ResponsePadding = intPtr(config.AmnezS2)
+			configWg.Jc = intPtr(config.AmnezJc)
+			configWg.Jmin = intPtr(config.AmnezJmin)
+			configWg.Jmax = intPtr(config.AmnezJmax)
 
-			// Headers
-			configWg.InitHeader = strPtr(config.AmnezH1)
-			configWg.ResponseHeader = strPtr(config.AmnezH2)
-			configWg.CookieHeader = strPtr(config.AmnezH3)
-			configWg.TransportHeader = strPtr(config.AmnezH4)
+			configWg.S1 = intPtr(config.AmnezS1)
+			configWg.S2 = intPtr(config.AmnezS2)
+			configWg.S3 = intPtr(config.AmnezS3)
+			configWg.S4 = intPtr(config.AmnezS4)
+
+			configWg.H1 = strPtr(config.AmnezH1)
+			configWg.H2 = strPtr(config.AmnezH2)
+			configWg.H3 = strPtr(config.AmnezH3)
+			configWg.H4 = strPtr(config.AmnezH4)
 		}
 
 		if err := wgClient.ConfigureDevice(argIface, configWg); err != nil {
@@ -862,6 +906,12 @@ func printClientConfig(peerName string, peerData PeerData, serverPublicKey wgtyp
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("Jmax = %d\n", config.AmnezJmax))
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("S1 = %d\n", config.AmnezS1))
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("S2 = %d\n", config.AmnezS2))
+		if config.AmnezS3 > 0 {
+			amneziaParamsBuilder.WriteString(fmt.Sprintf("S3 = %d\n", config.AmnezS3))
+		}
+		if config.AmnezS4 > 0 {
+			amneziaParamsBuilder.WriteString(fmt.Sprintf("S4 = %d\n", config.AmnezS4))
+		}
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("H1 = %s\n", config.AmnezH1))
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("H2 = %s\n", config.AmnezH2))
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("H3 = %s\n", config.AmnezH3))
@@ -1065,35 +1115,10 @@ func isFlagPassed(name string) bool {
 	return found
 }
 
-// generateAmneziaParams populates the config with random obfuscation values
-// math/rand is enough for obfuscation, not crypto params
-func generateAmneziaParams(cfg *ServerConfig) {
-	// Seed random generator (Not strictly crypto-secure, but fine for obfuscation)
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	// 1. Junk Packets (Recommended: Jc 4-12, Jmin < Jmax)
-	cfg.AmnezJc = 5 + r.Intn(10)                     // 5 to 14 packets
-	cfg.AmnezJmin = 40 + r.Intn(20)                  // 40-60 bytes
-	cfg.AmnezJmax = cfg.AmnezJmin + 50 + r.Intn(100) // Jmin + 50-150 bytes
-
-	// 2. Payload Padding
-	cfg.AmnezS1 = 150 + r.Intn(100) // Init padding
-	cfg.AmnezS2 = 150 + r.Intn(100) // Response padding
-
-	// 3. Magic Headers (H1-H4) - simulating uint32 identifiers
-	// Using range roughly covering 32-bit integers but avoiding very small numbers
-	cfg.AmnezH1 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
-	cfg.AmnezH2 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
-	cfg.AmnezH3 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
-	cfg.AmnezH4 = fmt.Sprintf("%d", 1000000000+r.Intn(2000000000))
-}
-
-// intPtr is a helper to get a pointer to an int generic literal
 func intPtr(i int) *int {
 	return &i
 }
 
-// strPtr is a helper to get a pointer to a string literal
 func strPtr(s string) *string {
 	return &s
 }
