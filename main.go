@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -27,7 +28,8 @@ const (
 	defaultIface         = "wg0"
 	defaultSubnet        = "10.8.0.1/24"
 	defaultNatIface      = ""
-	dbFileName           = "jwg.db"
+	defaultDBName        = "jwg.db"
+	defaultSystemDBDir   = "/var/lib/jwg"
 	dbMapPeers           = "peers"
 	dbMapKeyServerConfig = "config"
 	defaultDNS           = "8.8.8.8, 1.1.1.1" // Default DNS for client configs
@@ -65,6 +67,7 @@ var (
 	argSubnet   string
 	argNatIface string
 	argDNS      string = defaultDNS
+	argDBPath   string
 
 	err error
 )
@@ -117,6 +120,7 @@ func main() {
 	flag.StringVar(&argSubnet, "subnet", defaultSubnet, "Subnet for the server's wg interface (used for initial setup)")
 	flag.StringVar(&argNatIface, "nat-iface", defaultNatIface, "Public-facing network interface for NAT (leave empty to auto-detect)")
 	flag.StringVar(&argDNS, "dns", defaultDNS, "DNS servers for client configs")
+	flag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -132,7 +136,15 @@ func main() {
 		log.Fatalf("The -ip flag can only be used when adding a new peer with the -add flag.")
 	}
 
-	// --- Persistence/Config ---
+	// --- Persistence/Config Logic ---
+
+	dbPath := resolveDBPath(argDBPath)
+	fmt.Printf("%s[INFO]%s Using database: %s\n", colorCyan, colorReset, dbPath)
+
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		log.Fatalf("Failed to create directory for database at %s: %v", filepath.Dir(dbPath), err)
+	}
+
 	store = persist.New()
 
 	peerDataMap, err = persist.Map[PeerData](store, dbMapPeers)
@@ -140,7 +152,7 @@ func main() {
 		log.Fatalf("failed to create peers map: %v", err)
 	}
 
-	if err = store.Open(dbFileName); err != nil {
+	if err = store.Open(dbPath); err != nil {
 		log.Fatalf("failed to open persistence store: %v", err)
 	}
 	defer store.Close()
@@ -427,6 +439,12 @@ func main() {
 		}
 
 		if err := wgClient.ConfigureDevice(argIface, configWg); err != nil {
+			// Check for EADDRINUSE error. The userspace library returns "errno=-98",
+			// while kernel implementations/standard Go lib return "address already in use".
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "errno=-98") || strings.Contains(errMsg, "address already in use") {
+				log.Fatalf("%s[ERR]%s Port %d is already in use by another process.\n", colorRed, colorReset, argPort)
+			}
 			log.Fatalf("Failed to configure WireGuard device: %v", err)
 		}
 		fmt.Printf("  %s[OK]%s Synced interface %s with private key, listen port, and %d peers.\n", colorGreen, colorReset, argIface, len(allPeers))
@@ -1088,6 +1106,29 @@ func printPeerDetails(p wgtypes.Peer, publicKeyToName map[wgtypes.Key]string) {
 	if p.PersistentKeepaliveInterval > 0 {
 		printInfo("Persistent Keepalive", p.PersistentKeepaliveInterval.String())
 	}
+}
+
+// Priority:
+// 1. Explicit flag (-db)
+// 2. Existing file in current directory (legacy/local mode)
+// 3. System path (/var/lib/jwg/jwg.db)
+func resolveDBPath(flagPath string) string {
+	// 1. Explicit flag
+	if flagPath != "" {
+		return flagPath
+	}
+
+	// 2. Check current directory for existing DB (Backward compatibility)
+	cwd, err := os.Getwd()
+	if err == nil {
+		localPath := filepath.Join(cwd, defaultDBName)
+		if _, err := os.Stat(localPath); err == nil {
+			return localPath
+		}
+	}
+
+	// 3. Default to system path
+	return filepath.Join(defaultSystemDBDir, defaultDBName)
 }
 
 // formatBytes is a helper function to convert byte counts into a human-readable string.

@@ -16,7 +16,7 @@ Crucially, it is compatible with **AmneziaWG-go**.
 *   **🚫 No Web UI Needed:** Forget about `docker-compose`, web servers, or opening HTTP ports. Manage your VPN entirely via SSH.
 *   **🔋 Battery Included:** Handles **NAT**, **Packet Forwarding**, and **Firewall** (nftables & UFW) automatically. You don't need to be a Linux network engineer to set this up.
 *   **📱 QR Codes in Terminal:** Generate configs and display QR codes directly in the console for instant mobile connection.
-*   **📂 Embedded Database:** Stores peers in a local `jwg.db` file. Zero external dependencies.
+*   **📂 Embedded Database:** Stores peers in a `jwg.db` file. Zero external dependencies.
 
 ---
 
@@ -68,8 +68,17 @@ Add a new peer. `jwg` will find the next available IP, generate keys, and sync t
 | `jwg -show <name>` | Display config and QR code for an existing peer. |
 | `jwg` | Show server status, used IPs, and connected peers. |
 
-### Persistent Configuration
+### Configuration & Storage
 Flags override default settings and **persist** in the database.
+
+**Database Location:**
+`jwg` first checks for `./jwg.db`. If not found, it defaults to `/var/lib/jwg/jwg.db`. You can specify a custom path manually:
+
+```bash
+jwg -db /etc/wireguard/my_vpn.db
+```
+
+**Network Settings:**
 
 ```bash
 # Set custom listen port
