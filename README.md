@@ -13,9 +13,9 @@ Crucially, it is compatible with **AmneziaWG-go**.
 ## ✨ Why jwg?
 
 *   **👻 AmneziaWG Ready:** Designed to work seamlessly with `amneziawg-go` and `wireguard-go` interfaces, not just kernel modules.
-*   **🚫 No Web UI Needed:** Forget about `docker-compose`, web servers, or opening HTTP ports. Manage your VPN entirely via SSH.
+*   **🚫 No Web UI Needed:** Forget about `docker-compose`, databases, or opening HTTP ports.
 *   **🔋 Battery Included:** Handles **NAT**, **Packet Forwarding**, and **Firewall** (nftables & UFW) automatically. You don't need to be a Linux network engineer to set this up.
-*   **📱 QR Codes in Terminal:** Generate configs and display QR codes directly in the console for instant mobile connection.
+*   **📱 QR Codes in Terminal:** Generate configs and display QR codes directly in the console.
 *   **📂 Embedded Database:** Stores peers in a `jwg.db` file. Zero external dependencies.
 
 ---
