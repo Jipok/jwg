@@ -375,6 +375,7 @@ func main() {
 		if err := applyNftablesRules(argSubnet, argIface, argNatIface); err != nil {
 			log.Fatalf("Failed to apply nftables configuration: %v", err)
 		}
+		checkAndFixIptablesZombieRules(argIface)
 		checkAndConfigureUFW(argPort, argIface, argNatIface)
 
 		fmt.Printf("%s[OK]%s Firewall rules updated for port %d.\n", colorGreen, colorReset, argPort)
@@ -572,6 +573,7 @@ func runInitialNetworkSetup() {
 	}
 	fmt.Printf("    %s[OK]%s Nftables rules applied to table 'jwg'.\n", colorGreen, colorReset)
 
+	checkAndFixIptablesZombieRules(argIface)
 	checkAndConfigureUFW(argPort, argIface, argNatIface)
 }
 
@@ -659,6 +661,32 @@ func checkAndConfigureUFW(port int, wgIface, natIface string) {
 	} else {
 		fmt.Printf("    - Rule ensured: route allow in on %s out on %s\n", wgIface, natIface)
 	}
+}
+
+// Fixes issues on VPS templates where UFW is "inactive",
+// but iptables-legacy still has a default FORWARD DROP policy left in the kernel.
+func checkAndFixIptablesZombieRules(wgIface string) {
+	_, err := exec.LookPath("iptables")
+	if err != nil {
+		return
+	}
+
+	fmt.Printf("  %s[FIREWALL]%s Ensuring iptables compatibility (bypassing zombie DROP policies)...\n", colorCyan, colorReset)
+
+	ensureIptablesRule := func(directionFlag string) {
+		checkCmd := exec.Command("iptables", "-C", "FORWARD", directionFlag, wgIface, "-j", "ACCEPT")
+		if err := checkCmd.Run(); err != nil {
+			insertCmd := exec.Command("iptables", "-I", "FORWARD", "1", directionFlag, wgIface, "-j", "ACCEPT")
+			if err := insertCmd.Run(); err != nil {
+				fmt.Printf("    %s[WARN]%s Failed to insert iptables rule for %s: %v\n", colorYellow, colorReset, wgIface, err)
+			} else {
+				fmt.Printf("    - Rule ensured: iptables -I FORWARD 1 %s %s -j ACCEPT\n", directionFlag, wgIface)
+			}
+		}
+	}
+
+	ensureIptablesRule("-i") // Ingress
+	ensureIptablesRule("-o") // Egress
 }
 
 // runCmd is a helper to execute shell commands and log their output.
