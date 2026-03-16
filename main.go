@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +20,7 @@ import (
 	"github.com/Jipok/wgctrl-go"
 	"github.com/Jipok/wgctrl-go/wgtypes"
 	"github.com/skip2/go-qrcode"
+	"github.com/spf13/pflag"
 )
 
 const (
@@ -32,7 +32,7 @@ const (
 	defaultSystemDBDir   = "/var/lib/jwg"
 	dbMapPeers           = "peers"
 	dbMapKeyServerConfig = "config"
-	defaultDNS           = "8.8.8.8, 1.1.1.1" // Default DNS for client configs
+	defaultDNS           = "8.8.8.8, 1.1.1.1"
 )
 
 // --- ANSI Color Codes for formatted output ---
@@ -56,17 +56,14 @@ var (
 	peerDataMap *persist.PersistMap[PeerData]
 	wgClient    *wgctrl.Client
 
-	// Command-line flags mapped to variables
-	argAddPeer  string // Name of the peer to add
-	argDelPeer  string // Name of the peer to delete
-	argShowPeer string // Name of the peer to show config and QR code for
-	argPeerIP   string // Optional IP for the new peer
+	// Flags
+	argPeerIP   string
 	argIface    string
 	argPort     int
 	argEndpoint string
 	argSubnet   string
 	argNatIface string
-	argDNS      string = defaultDNS
+	argDNS      string
 	argDBPath   string
 
 	err error
@@ -110,18 +107,49 @@ type PeerData struct {
 }
 
 func main() {
-	flag.StringVar(&argAddPeer, "add", "", "Name of the new peer to add (e.g., 'device1')")
-	flag.StringVar(&argDelPeer, "del", "", "Name of the peer to delete (e.g., 'device2')")
-	flag.StringVar(&argShowPeer, "show", "", "Name of an existing peer to show config and QR code for")
-	flag.StringVar(&argPeerIP, "ip", "", "Optional: IP address for the new peer (e.g., '10.8.0.5/32'). If not set, it's assigned automatically.")
-	flag.IntVar(&argPort, "port", defaultPort, "Port for WireGuard server to listen on")
-	flag.StringVar(&argIface, "iface", defaultIface, "WireGuard interface name")
-	flag.StringVar(&argEndpoint, "endpoint", "", "Public endpoint of the server (for 'add' action)")
-	flag.StringVar(&argSubnet, "subnet", defaultSubnet, "Subnet for the server's wg interface (used for initial setup)")
-	flag.StringVar(&argNatIface, "nat-iface", defaultNatIface, "Public-facing network interface for NAT (leave empty to auto-detect)")
-	flag.StringVar(&argDNS, "dns", defaultDNS, "DNS servers for client configs")
-	flag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
-	flag.Parse()
+	pflag.StringVar(&argPeerIP, "ip", "", "Optional: IP address for the new peer (e.g., '10.8.0.5/32'). Used with 'add' command.")
+	pflag.IntVar(&argPort, "port", defaultPort, "Port for WireGuard server to listen on")
+	pflag.StringVar(&argIface, "iface", defaultIface, "WireGuard interface name")
+	pflag.StringVar(&argEndpoint, "endpoint", "", "Public endpoint of the server")
+	pflag.StringVar(&argSubnet, "subnet", defaultSubnet, "Subnet for the server's wg interface")
+	pflag.StringVar(&argNatIface, "nat-iface", defaultNatIface, "Public-facing network interface for NAT (leave empty to auto-detect)")
+	pflag.StringVar(&argDNS, "dns", defaultDNS, "DNS servers for client configs")
+	pflag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
+
+	pflag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [command] [flags]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Commands:\n")
+		fmt.Fprintf(os.Stderr, "  add <peer>    Add a new peer\n")
+		fmt.Fprintf(os.Stderr, "  del <peer>    Delete an existing peer\n")
+		fmt.Fprintf(os.Stderr, "  show <peer>   Show config and QR code for a peer\n")
+		fmt.Fprintf(os.Stderr, "  <none>        Sync server configuration and show status\n\n")
+		fmt.Fprintf(os.Stderr, "Flags:\n")
+		pflag.PrintDefaults()
+	}
+
+	pflag.Parse()
+
+	// Parse Custom Subcommands from positional flags
+	args := pflag.Args()
+	var command, peerName string
+
+	if len(args) > 0 {
+		command = args[0]
+		if len(args) > 1 {
+			peerName = args[1]
+		}
+	}
+
+	switch command {
+	case "add", "del", "rm", "show":
+		if peerName == "" {
+			log.Fatalf("%s[ERR]%s Command '%s' requires a peer name. (e.g., %s %s phone)", colorRed, colorReset, command, os.Args[0], command)
+		}
+	case "":
+		// Default sync/info mode
+	default:
+		log.Fatalf("%s[ERR]%s Unknown command '%s'. Valid commands are: add, del, show", colorRed, colorReset, command)
+	}
 
 	if os.Geteuid() != 0 {
 		log.Fatalf("%s[ERR]%s This program must be run as root (sudo) to manage network interfaces and firewall rules.", colorRed, colorReset)
@@ -132,8 +160,8 @@ func main() {
 		log.Fatalf("%s[ERR]%s 'nft' command not found. Please install nftables (e.g., apt install nftables).", colorRed, colorReset)
 	}
 
-	if argPeerIP != "" && argAddPeer == "" {
-		log.Fatalf("The -ip flag can only be used when adding a new peer with the -add flag.")
+	if argPeerIP != "" && command != "add" {
+		log.Fatalf("The --ip flag can only be used when adding a new peer with the 'add' command.")
 	}
 
 	// --- Persistence/Config Logic ---
@@ -196,9 +224,7 @@ func main() {
 		config.DNS = defaultDNS
 	}
 
-	// Apply Command Line Flags overrides
-	// We check if the flag was explicitly passed by the user, regardless of its value.
-	// This allows users to revert settings to default values (e.g. -port 31797).
+	// Override specific config fields if user explicitly passed the corresponding flag
 	if isFlagPassed("iface") {
 		config.Interface = argIface
 		configDirty = true
@@ -267,50 +293,25 @@ func main() {
 	if d, err := wgClient.Device(argIface); err == nil {
 		if d.IsAmnezia {
 			isAmneziaDevice = true
-			// Check if we need to generate params. Use Local Store values to check existence.
+			// Check if we need to generate params. Use Local Store values to check existence
 			if config.AmnezJc == 0 || config.AmnezH1 == "" {
 				fmt.Printf("%s[AMNEZIA]%s Detected AmneziaWG interface. Generating obfuscation parameters...\n", colorPurple, colorReset)
 
-				// Create a temporary config to utilize the library's generation logic
 				var tempWgCfg wgtypes.Config
 				tempWgCfg.GenerateAmneziaParams()
 
 				// Map generated values back to persistent ServerConfig
-				if tempWgCfg.Jc != nil {
-					config.AmnezJc = *tempWgCfg.Jc
-				}
-				if tempWgCfg.Jmin != nil {
-					config.AmnezJmin = *tempWgCfg.Jmin
-				}
-				if tempWgCfg.Jmax != nil {
-					config.AmnezJmax = *tempWgCfg.Jmax
-				}
-
-				if tempWgCfg.S1 != nil {
-					config.AmnezS1 = *tempWgCfg.S1
-				}
-				if tempWgCfg.S2 != nil {
-					config.AmnezS2 = *tempWgCfg.S2
-				}
-				if tempWgCfg.S3 != nil {
-					config.AmnezS3 = *tempWgCfg.S3
-				}
-				if tempWgCfg.S4 != nil {
-					config.AmnezS4 = *tempWgCfg.S4
-				}
-
-				if tempWgCfg.H1 != nil {
-					config.AmnezH1 = *tempWgCfg.H1
-				}
-				if tempWgCfg.H2 != nil {
-					config.AmnezH2 = *tempWgCfg.H2
-				}
-				if tempWgCfg.H3 != nil {
-					config.AmnezH3 = *tempWgCfg.H3
-				}
-				if tempWgCfg.H4 != nil {
-					config.AmnezH4 = *tempWgCfg.H4
-				}
+				config.AmnezJc = *tempWgCfg.Jc
+				config.AmnezJmin = *tempWgCfg.Jmin
+				config.AmnezJmax = *tempWgCfg.Jmax
+				config.AmnezS1 = *tempWgCfg.S1
+				config.AmnezS2 = *tempWgCfg.S2
+				config.AmnezS3 = *tempWgCfg.S3
+				config.AmnezS4 = *tempWgCfg.S4
+				config.AmnezH1 = *tempWgCfg.H1
+				config.AmnezH2 = *tempWgCfg.H2
+				config.AmnezH3 = *tempWgCfg.H3
+				config.AmnezH4 = *tempWgCfg.H4
 
 				configDirty = true
 			}
@@ -329,7 +330,7 @@ func main() {
 	if config.Endpoint == "" {
 		publicIP, err := detectPublicIP()
 		if err != nil {
-			log.Fatalf("Failed to auto-detect public IP and -endpoint flag not provided: %v", err)
+			log.Fatalf("Failed to auto-detect public IP and --endpoint flag not provided: %v", err)
 		}
 		config.Endpoint = net.JoinHostPort(publicIP, fmt.Sprintf("%d", argPort))
 		configDirty = true
@@ -344,18 +345,18 @@ func main() {
 	}
 
 	// --- Action Router ---
-	if argShowPeer != "" {
-		runShowPeer(argShowPeer)
-		return
+	if command == "show" {
+		runShowPeer(peerName)
+		return // Early exit, no sync required for Show
 	}
-	if argAddPeer != "" {
-		runAddPeer(argAddPeer)
+	if command == "add" {
+		runAddPeer(peerName)
 	}
-	if argDelPeer != "" {
-		runDelPeer(argDelPeer)
+	if command == "del" || command == "rm" {
+		runDelPeer(peerName)
 	}
 
-	mutatingAction := argAddPeer != "" || argDelPeer != ""
+	mutatingAction := command == "add" || command == "del" || command == "rm"
 
 	// Check environment and configure firewall/interfaces
 	if !isInterfaceConfigured(argIface, argSubnet) {
@@ -368,7 +369,7 @@ func main() {
 		fmt.Printf("%s[CONF]%s Configuration changed (Port/Subnet/NAT). Updating firewall rules...\n", colorYellow, colorReset)
 
 		if argNatIface == "" {
-			log.Fatalf("NAT interface could not be auto-detected. Please use -nat-iface.")
+			log.Fatalf("NAT interface could not be auto-detected. Please use --nat-iface.")
 		}
 
 		// Re-apply firewall rules
@@ -451,8 +452,8 @@ func main() {
 		fmt.Printf("  %s[OK]%s Synced interface %s with private key, listen port, and %d peers.\n", colorGreen, colorReset, argIface, len(allPeers))
 	}
 
-	// Only show final state if not just adding a peer
-	if argAddPeer == "" && argDelPeer == "" {
+	// Only show final state if not mutating
+	if command == "" {
 		runShowInfo()
 	}
 }
@@ -536,7 +537,7 @@ func runInitialNetworkSetup() {
 		fmt.Printf("%s[INFO]%s NAT interface not specified. Attempting auto-detection...\n", colorCyan, colorReset)
 		detectedIface, err := detectDefaultInterface()
 		if err != nil {
-			fmt.Printf("%s[ERR]%s Failed to auto-detect default interface: %v.\n   %sSet it manually with -nat-iface%s\n", colorYellow, colorReset, err, colorBlue, colorReset)
+			fmt.Printf("%s[ERR]%s Failed to auto-detect default interface: %v.\n   %sSet it manually with --nat-iface%s\n", colorYellow, colorReset, err, colorBlue, colorReset)
 			os.Exit(1)
 		} else {
 			argNatIface = detectedIface
@@ -704,7 +705,7 @@ func runCmd(name string, args ...string) error {
 	return nil
 }
 
-// detectPublicIP finds the server's public IP address using an external service.
+// detectPublicIP finds the server's public IPv4 address using an external service.
 func detectPublicIP() (string, error) {
 	// A list of services to try
 	services := []string{
@@ -842,7 +843,7 @@ func runAddPeer(peerName string) {
 		// Validate that the provided IP is a valid single-host CIDR.
 		ipPrefix, err := netip.ParsePrefix(argPeerIP)
 		if err != nil {
-			log.Fatalf("Invalid format for -ip flag '%s': %v. Must be like '10.8.0.5/32'.", argPeerIP, err)
+			log.Fatalf("Invalid format for --ip flag '%s': %v. Must be like '10.8.0.5/32'.", argPeerIP, err)
 		}
 		if !ipPrefix.IsSingleIP() {
 			log.Fatalf("IP address '%s' must be a single host address (e.g., with a /32 mask for IPv4).", argPeerIP)
@@ -1173,17 +1174,11 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.2f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// Helper function to check if a specific flag was passed in the command line arguments
 func isFlagPassed(name string) bool {
-	found := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
+	return pflag.CommandLine.Changed(name)
 }
 
+// Helpers for assigning struct pointers without allocating temporary variables everywhere
 func intPtr(i int) *int {
 	return &i
 }
