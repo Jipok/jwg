@@ -20,39 +20,48 @@ Crucially, it is compatible with **AmneziaWG-go**.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Installation & Quick Start
 
-### 1. Start the Interface
-`jwg` manages the *configuration logic*, but you need to keep the interface process running.
+### 1. Installation
 
-**Recommended: AmneziaWG**
+**Recommended: Automatic Installation**  
+Installs the required binaries, sets up a systemd service for AmneziaWG, and starts the VPN automatically.
 ```bash
+curl -sL https://raw.githubusercontent.com/Jipok/jwg/master/install.sh | sudo bash
+```
+
+<details>
+<summary><b>Alternative: Manual / Wireguard Setup</b> (Click to expand)</summary>
+
+`jwg` manages the *configuration logic*, but you need to run the interface process.
+
+**Start the Interface (choose one):**
+```bash
+# AmneziaWG (Userspace Go daemon)
 wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go
 chmod +x amneziawg-go
 ./amneziawg-go wg0
-```
 
-**Or: Standard Kernel WireGuard**
-```bash
+# OR Standard Kernel WireGuard
 ip link add dev wg0 type wireguard
 ```
 
-### 2. Initialize Server
+**Initialize JWG Server:**
 Run `jwg` for the first time. It will auto-detect your Public IP and apply necessary firewall rules.
-
 ```bash
 wget https://github.com/Jipok/jwg/releases/latest/download/jwg
 chmod +x jwg
 ./jwg
 ```
+</details>
 
-### 3. Add a Client
-Add a new peer. `jwg` will find the next available IP, generate keys, and sync the interface.
+### 2. Add a Client
+Once installed and running, just add a new peer. `jwg` will find the next available IP, generate keys, and sync the interface on the fly.
 
 ```bash
-./jwg -add phone
+jwg -add phone
 ```
-*The output matches the standard client config format and includes a QR code.*
+*The output matches the standard client config format and includes a QR code right in your terminal.*
 
 ---
 
@@ -96,8 +105,29 @@ jwg -subnet "192.168.100.1/24"
 
 ---
 
-## 🔥 Firewall & Networking
-`jwg` is opinionated about networking to save you time:
-1.  **Forwarding:** It enables kernel IP forwarding.
-2.  **NAT:** It creates a dedicated `jwg_nat` table in **nftables** to masquerade traffic (allow peers to access the internet).
-3.  **UFW Support:** If UFW is active, `jwg` automatically adds generic allows and route rules to prevent silent packet drops.
+## 🐧 Power User: The Ultimate Setup (Void Linux & Kernel Module)
+
+By default, the auto-installer uses the userspace `amneziawg-go` daemon, which is great for compatibility. However, if you want **maximum performance**, you need the kernel module.
+
+If you have a fresh/cheap VPS (Ubuntu/Debian) and want a completely bloat-free environment, you can use my [void-infect](https://github.com/Jipok/void-infect) script to replace the existing OS with **Void Linux** on the fly. 
+
+My custom Void repository already contains the **AmneziaWG DKMS kernel module** and `jwg` with native `runit` services.
+
+**1. Reinstall your VPS to Void Linux (takes ~2 mins):**
+```bash
+wget https://raw.githubusercontent.com/Jipok/void-infect/master/void-infect.sh
+chmod +x void-infect.sh
+./void-infect.sh YourGithubUsername
+```
+*(Server will automatically reboot into a fresh Void Linux system).*
+
+**2. Install kernel AmneziaWG and JWG:**
+```bash
+# Install kernel headers, the DKMS module, and jwg
+xbps-install linux-lts-headers jwg
+
+# Enable the runit service
+ln -s /etc/sv/jwg-awg0 /var/service/
+```
+
+This gives you a pure, natively integrated WireGuard/AmneziaWG server running entirely in kernel space without systemd overhead. Just type `jwg -add client` and you're good to go.
