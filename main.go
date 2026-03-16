@@ -24,15 +24,16 @@ import (
 )
 
 const (
-	defaultPort          = 31797
-	defaultIface         = "wg0"
-	defaultSubnet        = "10.8.0.1/24"
-	defaultNatIface      = ""
-	defaultDBName        = "jwg.db"
-	defaultSystemDBDir   = "/var/lib/jwg"
-	dbMapPeers           = "peers"
-	dbMapKeyServerConfig = "config"
-	defaultDNS           = "8.8.8.8, 1.1.1.1"
+	defaultPort             = 31797
+	defaultIface            = "wg0"
+	defaultSubnet           = "10.8.0.1/24"
+	defaultNatIface         = ""
+	defaultDBName           = "jwg.db"
+	defaultSystemDBDir      = "/var/lib/jwg"
+	dbMapPeers              = "peers"
+	dbMapKeyServerConfig    = "config"
+	defaultDNS              = "8.8.8.8, 1.1.1.1"
+	defaultClientAllowedIPs = "0.0.0.0/0"
 )
 
 // --- ANSI Color Codes for formatted output ---
@@ -57,27 +58,29 @@ var (
 	wgClient    *wgctrl.Client
 
 	// Flags
-	argPeerIP   string
-	argIface    string
-	argPort     int
-	argEndpoint string
-	argSubnet   string
-	argNatIface string
-	argDNS      string
-	argDBPath   string
+	argPeerIP           string
+	argIface            string
+	argPort             int
+	argEndpoint         string
+	argSubnet           string
+	argNatIface         string
+	argDNS              string
+	argClientAllowedIPs string
+	argDBPath           string
 
 	err error
 )
 
 // Persistent configuration
 type ServerConfig struct {
-	PrivateKey wgtypes.Key
-	Endpoint   string
-	Port       int
-	Subnet     string
-	NatIface   string
-	DNS        string
-	Interface  string
+	PrivateKey       wgtypes.Key
+	Endpoint         string
+	Port             int
+	Subnet           string
+	NatIface         string
+	DNS              string
+	ClientAllowedIPs string
+	Interface        string
 
 	// --- AmneziaWG Specific Params ---
 	// If 0 or empty, they are considered unset.
@@ -114,6 +117,7 @@ func main() {
 	pflag.StringVar(&argSubnet, "subnet", defaultSubnet, "Subnet for the server's wg interface")
 	pflag.StringVar(&argNatIface, "nat-iface", defaultNatIface, "Public-facing network interface for NAT (leave empty to auto-detect)")
 	pflag.StringVar(&argDNS, "dns", defaultDNS, "DNS servers for client configs")
+	pflag.StringVar(&argClientAllowedIPs, "client-allowed-ips", defaultClientAllowedIPs, "AllowedIPs range inside generated client configs")
 	pflag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
 
 	pflag.Usage = func() {
@@ -223,6 +227,9 @@ func main() {
 	if config.DNS == "" {
 		config.DNS = defaultDNS
 	}
+	if config.ClientAllowedIPs == "" {
+		config.ClientAllowedIPs = defaultClientAllowedIPs
+	}
 
 	// Override specific config fields if user explicitly passed the corresponding flag
 	if isFlagPassed("iface") {
@@ -262,6 +269,10 @@ func main() {
 		config.DNS = argDNS
 		configDirty = true
 	}
+	if isFlagPassed("client-allowed-ips") {
+		config.ClientAllowedIPs = argClientAllowedIPs
+		configDirty = true
+	}
 	if isFlagPassed("endpoint") {
 		config.Endpoint = argEndpoint
 		configDirty = true
@@ -274,6 +285,7 @@ func main() {
 	argSubnet = config.Subnet
 	argNatIface = config.NatIface
 	argDNS = config.DNS
+	argClientAllowedIPs = config.ClientAllowedIPs
 
 	// Interface validation
 	if _, err := net.InterfaceByName(argIface); err != nil {
@@ -974,7 +986,7 @@ DNS = %s%s
 PublicKey = %s
 PresharedKey = %s
 Endpoint = %s
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = %s
 PersistentKeepalive = 25
 `,
 		peerData.PrivateKey.String(),
@@ -984,6 +996,7 @@ PersistentKeepalive = 25
 		serverPublicKey.String(),
 		psk,
 		config.Endpoint,
+		config.ClientAllowedIPs,
 	)
 
 	fmt.Printf("\n%s%s---------- Client Configuration for '%s' -----------%s\n", colorBlue, colorBold, peerName, colorReset)
