@@ -93,6 +93,11 @@ type ServerConfig struct {
 	AmnezH2   string // ResponseHeader (magic)
 	AmnezH3   string // CookieHeader (magic)
 	AmnezH4   string // TransportHeader (magic)
+	AmnezI1   string // Init Packet Magic
+	AmnezI2   string // Response Packet Magic
+	AmnezI3   string // Cookie Packet Magic
+	AmnezI4   string // Transport Packet Magic
+	AmnezI5   string // Additional obfuscation
 }
 
 // PeerData holds all necessary information about a peer, including its
@@ -353,6 +358,7 @@ func main() {
 				config.AmnezH2 = *tempWgCfg.H2
 				config.AmnezH3 = *tempWgCfg.H3
 				config.AmnezH4 = *tempWgCfg.H4
+				config.AmnezI1 = *tempWgCfg.I1
 
 				configDirty = true
 			}
@@ -383,6 +389,24 @@ func main() {
 		if err := store.Set(dbMapKeyServerConfig, config); err != nil {
 			log.Fatalf("Failed to save server config: %v", err)
 		}
+	}
+
+	if config.AmnezH1 != "" && !strings.Contains(config.AmnezH1, "-") {
+		fmt.Printf("\n%s%s======================================================================%s\n", colorRed, colorBold, colorReset)
+		fmt.Printf("%s%s[CRITICAL WARNING] VULNERABLE AMNEZIA WG CONFIGURATION DETECTED!%s\n\n", colorRed, colorBold, colorReset)
+
+		fmt.Printf("%sYour server is currently using legacy AmneziaWG 1.5 obfuscation parameters.%s\n", colorYellow, colorReset)
+		fmt.Printf("These parameters use static headers and are %svulnerable to DPI heuristic blocking%s.\n\n", colorRed, colorReset)
+
+		fmt.Printf("It is strictly recommended to generate new AWG 2.0 parameters (ranged\n")
+		fmt.Printf("headers and zero-collision padding) to ensure connection stability.\n\n")
+
+		fmt.Printf("How to upgrade:\n")
+		fmt.Printf("1. Delete the current database (this will reset the server keys and peers).\n")
+		fmt.Printf("   %srm %s%s\n", colorCyan, dbPath, colorReset)
+		fmt.Printf("2. Run this tool again to generate a fresh, secure configuration.\n")
+		fmt.Printf("3. Add your peers and scan the new QR codes on all devices.\n")
+		fmt.Printf("%s%s======================================================================%s\n\n", colorRed, colorBold, colorReset)
 	}
 
 	// --- Action Router ---
@@ -479,6 +503,10 @@ func main() {
 			configWg.H2 = strPtr(config.AmnezH2)
 			configWg.H3 = strPtr(config.AmnezH3)
 			configWg.H4 = strPtr(config.AmnezH4)
+
+			if config.AmnezI1 != "" { // Amnezia 2.0 marker
+				configWg.I1 = strPtr(config.AmnezI1)
+			}
 		}
 
 		if err := wgClient.ConfigureDevice(argIface, configWg); err != nil {
@@ -1107,6 +1135,9 @@ func printClientConfig(peerName string, peerData PeerData, serverPublicKey wgtyp
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("H2 = %s\n", config.AmnezH2))
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("H3 = %s\n", config.AmnezH3))
 		amneziaParamsBuilder.WriteString(fmt.Sprintf("H4 = %s\n", config.AmnezH4))
+		if config.AmnezI1 != "" {
+			amneziaParamsBuilder.WriteString(fmt.Sprintf("I1 = %s\n", config.AmnezI1))
+		}
 	}
 
 	clientConfig := fmt.Sprintf(`[Interface]
