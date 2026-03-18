@@ -67,8 +67,6 @@ var (
 	argDNS              string
 	argClientAllowedIPs string
 	argDBPath           string
-
-	err error
 )
 
 // Persistent configuration
@@ -110,7 +108,7 @@ type PeerData struct {
 }
 
 func main() {
-	pflag.StringVar(&argPeerIP, "ip", "", "Optional: IP address for the new peer (e.g., '10.8.0.5/32'). Used with 'add' command.")
+	pflag.StringVar(&argPeerIP, "ip", "", "Optional: IP address for the new peer (e.g., '10.8.0.5'). Used with 'add' command.")
 	pflag.IntVar(&argPort, "port", defaultPort, "Port for WireGuard server to listen on")
 	pflag.StringVar(&argIface, "iface", defaultIface, "WireGuard interface name")
 	pflag.StringVar(&argEndpoint, "endpoint", "", "Public endpoint of the server")
@@ -136,6 +134,10 @@ func main() {
 	// Parse Custom Subcommands from positional flags
 	args := pflag.Args()
 	var command, peerName string
+
+	if len(args) > 2 {
+		log.Fatalf("Too many arguments. Usage: jwg [command] [peer]")
+	}
 
 	if len(args) > 0 {
 		command = args[0]
@@ -163,6 +165,9 @@ func main() {
 	if _, err := exec.LookPath("nft"); err != nil {
 		log.Fatalf("%s[ERR]%s 'nft' command not found. Please install nftables (e.g., apt install nftables).", colorRed, colorReset)
 	}
+	if _, err := exec.LookPath("ip"); err != nil {
+		log.Fatalf("%s[ERR]%s 'ip' command not found. Please install iproute2 (e.g., apt install iproute2).", colorRed, colorReset)
+	}
 
 	if argPeerIP != "" && command != "add" {
 		log.Fatalf("The --ip flag can only be used when adding a new peer with the 'add' command.")
@@ -173,12 +178,13 @@ func main() {
 	dbPath := resolveDBPath(argDBPath)
 	fmt.Printf("%s[INFO]%s Using database: %s\n", colorCyan, colorReset, dbPath)
 
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
 		log.Fatalf("Failed to create directory for database at %s: %v", filepath.Dir(dbPath), err)
 	}
 
 	store = persist.New()
 
+	var err error
 	peerDataMap, err = persist.Map[PeerData](store, dbMapPeers)
 	if err != nil {
 		log.Fatalf("failed to create peers map: %v", err)
@@ -274,6 +280,10 @@ func main() {
 		configDirty = true
 	}
 	if isFlagPassed("endpoint") {
+		_, _, err := net.SplitHostPort(argEndpoint)
+		if err != nil { // Empty port
+			argEndpoint = net.JoinHostPort(argEndpoint, fmt.Sprintf("%d", argPort))
+		}
 		config.Endpoint = argEndpoint
 		configDirty = true
 		fmt.Printf("%s[OK]%s Manual endpoint set via flag: %s%s%s\n", colorGreen, colorReset, colorBold, config.Endpoint, colorReset)
@@ -599,8 +609,11 @@ func applyNftablesRules(subnet, wgIface, natIface string) error {
 	// although strictly speaking, an explicit DROP in another table will still win in Netfilter.
 	// But this setup is cleaner and idempotent.
 
+	// We use a safe trick to ensure idempotency and compatibility:
+	// 1. 'add table' creates the table if it doesn't exist (no-op if it does).
+	// 2. 'delete table' flushes it and removes it.
+	// 3. The second 'add table' creates a fresh, clean table.
 	nftScript := fmt.Sprintf(`
-# Define table for filtering (IPv4/IPv6)
 add table inet jwg_filter
 delete table inet jwg_filter
 
@@ -646,6 +659,7 @@ func checkAndConfigureUFW(port int, wgIface, natIface string) {
 
 	// Check if UFW is active
 	cmd := exec.Command("ufw", "status")
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	output, err := cmd.CombinedOutput()
 
 	// If UFW is not active, do nothing (firewall is likely disabled)
@@ -808,27 +822,29 @@ func getUsedIPs() (map[string]struct{}, error) {
 
 // findNextAvailableIP searches the server's subnet for an unused IP address.
 func findNextAvailableIP() (string, error) {
-	// 1. Parse the server's subnet to get the valid range.
 	prefix, err := netip.ParsePrefix(argSubnet)
 	if err != nil {
 		return "", fmt.Errorf("could not parse server subnet '%s': %w", argSubnet, err)
 	}
 	// Normalize to discard host bits (e.g. 10.8.0.1/24 -> 10.8.0.0/24)
-	prefix = prefix.Masked()
+	network := prefix.Masked()
 
-	// 2. Collect all IPs currently in use.
 	usedIPs, err := getUsedIPs()
 	if err != nil {
 		return "", fmt.Errorf("could not get list of used IPs: %w", err)
 	}
 
-	serverIP, _ := netip.ParseAddr(strings.Split(argSubnet, "/")[0])
+	// Iterate through all IPs in the subnet.
+	// We start from network.Addr().Next() to skip the network address (e.g., .0)
+	for ip := network.Addr().Next(); prefix.Contains(ip); ip = ip.Next() {
+		// Skip the broadcast address (the very last IP in an IPv4 subnet).
+		// If ip.Next() is out of the subnet bounds, then 'ip' is the broadcast address.
+		if ip.Is4() && !prefix.Contains(ip.Next()) {
+			continue
+		}
 
-	// 3. Iterate through all IPs in the subnet and return the first one not in our set.
-	// We start from the server's IP and check the next one.
-	for ip := serverIP.Next(); prefix.Contains(ip); ip = ip.Next() {
+		// If the IP is not in our used map, we found a winner
 		if _, isUsed := usedIPs[ip.String()]; !isUsed {
-			// Found an available IP. Return it in CIDR format for a single host.
 			return ip.String() + "/32", nil
 		}
 	}
@@ -852,16 +868,21 @@ func runAddPeer(peerName string) {
 	// If user provides an IP, validate and use it. Otherwise, find one.
 	if argPeerIP != "" {
 		fmt.Printf("%s[INFO]%s Using user-provided IP for new peer '%s'...\n", colorCyan, colorReset, peerName)
-		// Validate that the provided IP is a valid single-host CIDR.
+		if !strings.Contains(argPeerIP, "/") {
+			argPeerIP += "/32"
+		}
+
 		ipPrefix, err := netip.ParsePrefix(argPeerIP)
 		if err != nil {
-			log.Fatalf("Invalid format for --ip flag '%s': %v. Must be like '10.8.0.5/32'.", argPeerIP, err)
-		}
-		if !ipPrefix.IsSingleIP() {
-			log.Fatalf("IP address '%s' must be a single host address (e.g., with a /32 mask for IPv4).", argPeerIP)
+			log.Fatalf("Invalid format for --ip flag '%s': %v. Must be like '10.8.0.5'.", argPeerIP, err)
 		}
 		peerIP = argPeerIP
 		userIP := ipPrefix.Addr()
+
+		serverPrefix, _ := netip.ParsePrefix(config.Subnet)
+		if !serverPrefix.Contains(userIP) {
+			log.Fatalf("Provided IP %s does not belong to server subnet %s", userIP, config.Subnet)
+		}
 
 		// Check if this IP is already in use.
 		usedIPs, err := getUsedIPs()
@@ -871,14 +892,12 @@ func runAddPeer(peerName string) {
 		if _, isUsed := usedIPs[userIP.String()]; isUsed {
 			log.Fatalf("The provided IP address '%s' is already in use.", userIP)
 		}
-		fmt.Printf("  %s[OK]%s Using validated IP: %s%s%s\n", colorGreen, colorReset, colorBold, peerIP, colorReset)
 	} else {
-		fmt.Printf("%s[INFO]%s Finding next available IP for new peer '%s'...\n", colorCyan, colorReset, peerName)
 		peerIP, err = findNextAvailableIP()
 		if err != nil {
 			log.Fatalf("Failed to find an available IP: %v", err)
 		}
-		fmt.Printf("  %s[OK]%s Assigned next available IP: %s%s%s\n", colorGreen, colorReset, colorBold, peerIP, colorReset)
+		// fmt.Printf("  %s[OK]%s Assigned next available IP: %s%s%s\n", colorGreen, colorReset, colorBold, peerIP, colorReset)
 	}
 
 	// --- 1. Get Server's Public Key for client config ---
@@ -896,7 +915,7 @@ func runAddPeer(peerName string) {
 	peerPublicKey := peerPrivateKey.PublicKey()
 
 	// --- 3. Create peer configuration objects ---
-	_, parsedIPNet, err := net.ParseCIDR(peerIP) // Use the auto-found IP
+	_, parsedIPNet, err := net.ParseCIDR(peerIP)
 	if err != nil {
 		log.Fatalf("invalid peer IP address format: %v", err)
 	}
@@ -918,28 +937,20 @@ func runAddPeer(peerName string) {
 	if err := peerDataMap.SetFSync(peerName, newPeerData); err != nil {
 		log.Fatalf("Failed to save new peer '%s' to persistent store: %v", peerName, err)
 	}
-	fmt.Printf("%s[DB]%s Peer '%s' (%s) saved. It will be applied on this run.\n", colorCyan, colorReset, peerName, peerPublicKey.String())
+	fmt.Printf("%s[DB]%s Peer '%s' saved. It will be applied on this run.\n", colorCyan, colorReset, peerName)
 
 	// --- 5. Generate and show the client's configuration file ---
 	printClientConfig(peerName, newPeerData, serverPublicKey)
 }
 
 // runShowPeer generates and displays the client config and QR code for an existing peer.
-// This is a read-only operation.
 func runShowPeer(peerName string) {
-	// 1. Fetch peer data from the database.
 	peerData, exists := peerDataMap.Get(peerName)
 	if !exists {
 		log.Fatalf("Peer with name '%s' not found in the database.", peerName)
 	}
 
-	// 2. Get the server's public key from the live interface.
-	serverDevice, err := wgClient.Device(argIface)
-	if err != nil {
-		log.Fatalf("Failed to get device '%s' to retrieve server public key: %v. Is the interface up?", argIface, err)
-	}
-	serverPublicKey := serverDevice.PublicKey
-
+	serverPublicKey := config.PrivateKey.PublicKey()
 	printClientConfig(peerName, peerData, serverPublicKey)
 }
 
