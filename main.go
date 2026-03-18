@@ -240,6 +240,7 @@ func main() {
 	if config.ClientAllowedIPs == "" {
 		config.ClientAllowedIPs = defaultClientAllowedIPs
 	}
+	oldPort := 0
 
 	// Override specific config fields if user explicitly passed the corresponding flag
 	if isFlagPassed("iface") {
@@ -251,6 +252,7 @@ func main() {
 		if config.Port != 0 && config.Port != argPort {
 			fmt.Printf("%s[WARN]%s Port changed from %d to %d. Existing clients will lose connection until their config is updated.\n", colorYellow, colorReset, config.Port, argPort)
 			firewallDirty = true
+			oldPort = config.Port
 		}
 		config.Port = argPort
 		configDirty = true
@@ -391,7 +393,7 @@ func main() {
 	if !isInterfaceConfigured(argIface, argSubnet) {
 		fmt.Printf("%s[WARN]%s Interface %s is not configured with IP %s. Running initial network setup...\n", colorYellow, colorReset, argIface, argSubnet)
 		// This runs full setup: IP assignment + UP + Firewall
-		runInitialNetworkSetup()
+		runInitialNetworkSetup(oldPort)
 		mutatingAction = true
 	} else if firewallDirty {
 		// Interface is UP, but port or NAT settings configuration changed via flags.
@@ -406,7 +408,7 @@ func main() {
 			log.Fatalf("Failed to apply nftables configuration: %v", err)
 		}
 		checkAndFixIptablesZombieRules(argIface)
-		checkAndConfigureUFW(argPort, argIface, argNatIface)
+		checkAndConfigureUFW(oldPort, argPort, argIface, argNatIface)
 
 		fmt.Printf("%s[OK]%s Firewall rules updated for port %d.\n", colorGreen, colorReset, argPort)
 		mutatingAction = true // Force WG sync to bind to new port
@@ -560,7 +562,7 @@ func isInterfaceConfigured(ifaceName, expectedAddr string) bool {
 	return false
 }
 
-func runInitialNetworkSetup() {
+func runInitialNetworkSetup(oldPort int) {
 	// Detect default interface
 	if argNatIface == "" {
 		fmt.Printf("%s[INFO]%s NAT interface not specified. Attempting auto-detection...\n", colorCyan, colorReset)
@@ -604,7 +606,7 @@ func runInitialNetworkSetup() {
 	fmt.Printf("    %s[OK]%s Nftables rules applied to table 'jwg'.\n", colorGreen, colorReset)
 
 	checkAndFixIptablesZombieRules(argIface)
-	checkAndConfigureUFW(argPort, argIface, argNatIface)
+	checkAndConfigureUFW(oldPort, argPort, argIface, argNatIface)
 	checkAndConfigureQdisc(argIface)
 }
 
@@ -657,9 +659,8 @@ add rule ip jwg_nat postrouting oifname "%s" ip saddr %s counter masquerade
 	return nil
 }
 
-// checkAndConfigureUFW ensures UFW allows both the listening port
-// and the forwarding of traffic from WireGuard to the internet.
-func checkAndConfigureUFW(port int, wgIface, natIface string) {
+// Ensures UFW allows both the listening port and the forwarding of traffic from WireGuard to the internet.
+func checkAndConfigureUFW(oldPort, newPort int, wgIface, natIface string) {
 	path, err := exec.LookPath("ufw")
 	if err != nil || path == "" {
 		return // UFW is not installed
@@ -670,15 +671,23 @@ func checkAndConfigureUFW(port int, wgIface, natIface string) {
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	output, err := cmd.CombinedOutput()
 
-	// If UFW is not active, do nothing (firewall is likely disabled)
 	if err != nil || !strings.Contains(string(output), "Status: active") {
 		return
 	}
 
 	fmt.Printf("  %s[FIREWALL]%s UFW is active. Applying compatibility rules...\n", colorPurple, colorReset)
 
-	// 1. Open the UDP port (Input)
-	portRule := fmt.Sprintf("%d/udp", port)
+	// 1. Delete the old UDP port (if port was changed)
+	if oldPort > 0 && oldPort != newPort {
+		oldRule := fmt.Sprintf("%d/udp", oldPort)
+		delCmd := exec.Command("ufw", "delete", "allow", oldRule)
+		if err := delCmd.Run(); err == nil {
+			fmt.Printf("    - Old rule deleted: allow %s\n", oldRule)
+		}
+	}
+
+	// 2. Open the new UDP port (Input)
+	portRule := fmt.Sprintf("%d/udp", newPort)
 	allowCmd := exec.Command("ufw", "allow", portRule)
 	if out, err := allowCmd.CombinedOutput(); err != nil {
 		fmt.Printf("    %s[WARN]%s Failed to start allowance for port %s: %s\n", colorYellow, colorReset, portRule, string(out))
@@ -686,10 +695,9 @@ func checkAndConfigureUFW(port int, wgIface, natIface string) {
 		fmt.Printf("    - Rule ensured: allow %s\n", portRule)
 	}
 
-	// 2. Allow Forwarding (Routing)
+	// 3. Allow Forwarding (Routing)
 	// Essential! Without this, connected clients have no internet access because
 	// UFW's default "routed" policy is usually DROP.
-	// Command: ufw route allow in on <wg0> out on <eth0>
 	routeCmd := exec.Command("ufw", "route", "allow", "in", "on", wgIface, "out", "on", natIface)
 	if out, err := routeCmd.CombinedOutput(); err != nil {
 		fmt.Printf("    %s[WARN]%s Failed to add UFW route rule (internet might be blocked): %s\n", colorYellow, colorReset, string(out))
