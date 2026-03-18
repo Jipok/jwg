@@ -108,8 +108,10 @@ type PeerData struct {
 }
 
 func main() {
+	log.SetFlags(0)
+
 	pflag.StringVar(&argPeerIP, "ip", "", "Optional: IP address for the new peer (e.g., '10.8.0.5'). Used with 'add' command.")
-	pflag.IntVar(&argPort, "port", defaultPort, "Port for WireGuard server to listen on")
+	pflag.IntVar(&argPort, "port", 0, "Port for WireGuard server to listen on (auto-assigned random port if omitted on first run)")
 	pflag.StringVar(&argIface, "iface", defaultIface, "WireGuard interface name")
 	pflag.StringVar(&argEndpoint, "endpoint", "", "Public endpoint of the server")
 	pflag.StringVar(&argSubnet, "subnet", defaultSubnet, "Subnet for the server's wg interface")
@@ -225,7 +227,9 @@ func main() {
 		config.Interface = defaultIface
 	}
 	if config.Port == 0 {
-		config.Port = defaultPort
+		config.Port = getFreeUDPPort()
+		configDirty = true
+		fmt.Printf("%s[INFO]%s Auto-assigned random port: %d\n", colorCyan, colorReset, config.Port)
 	}
 	if config.Subnet == "" {
 		config.Subnet = defaultSubnet
@@ -243,7 +247,8 @@ func main() {
 		configDirty = true
 	}
 	if isFlagPassed("port") {
-		if config.Port != argPort {
+		// Warn only if port changes and it's not the first run
+		if config.Port != 0 && config.Port != argPort {
 			fmt.Printf("%s[WARN]%s Port changed from %d to %d. Existing clients will lose connection until their config is updated.\n", colorYellow, colorReset, config.Port, argPort)
 			firewallDirty = true
 		}
@@ -253,14 +258,16 @@ func main() {
 		// Update Endpoint string automatically if port changes
 		if config.Endpoint != "" {
 			host, _, err := net.SplitHostPort(config.Endpoint)
-			if err == nil {
-				newEndpoint := net.JoinHostPort(host, fmt.Sprintf("%d", argPort))
-				if config.Endpoint != newEndpoint {
-					config.Endpoint = newEndpoint
-				}
+			if err != nil {
+				host = config.Endpoint
+			}
+			newEndpoint := net.JoinHostPort(host, fmt.Sprintf("%d", argPort))
+			if config.Endpoint != newEndpoint {
+				config.Endpoint = newEndpoint
 			}
 		}
 	}
+
 	if isFlagPassed("subnet") {
 		config.Subnet = argSubnet
 		configDirty = true
@@ -1228,6 +1235,16 @@ func resolveDBPath(flagPath string) string {
 
 	// 3. Default to system path
 	return filepath.Join(defaultSystemDBDir, defaultDBName)
+}
+
+func getFreeUDPPort() int {
+	addr, _ := net.ResolveUDPAddr("udp", ":0")
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return defaultPort
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).Port
 }
 
 // formatBytes is a helper function to convert byte counts into a human-readable string.
