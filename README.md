@@ -14,9 +14,9 @@ Crucially, it is compatible with **AmneziaWG-go**.
 
 *   **👻 AmneziaWG Ready:** Designed to work seamlessly with `amneziawg-go` and `wireguard-go` interfaces, not just kernel modules.
 *   **🚫 No Web UI Needed:** Forget about `docker-compose`, databases, or opening HTTP ports.
-*   **🔋 Battery Included:** Handles **NAT**, **Packet Forwarding**, and **Firewall** (nftables & UFW) automatically. You don't need to be a Linux network engineer to set this up.
+*   **🔋 Battery Included:** Handles **NAT**, **Packet Forwarding**, Anti-Bufferbloat (Smart QoS), and **Firewall** (nftables & UFW) automatically. You don't need to be a Linux network engineer to set this up.
 *   **📱 QR Codes in Terminal:** Generate configs and display QR codes directly in the console.
-*   **📂 Embedded Database:** Stores peers in a `jwg.db` file. Zero external dependencies.
+*   **📂 Embedded Database:** Stores configurations and peers in a single `jwg.db` file. Zero external dependencies.
 
 ---
 
@@ -33,21 +33,21 @@ curl -sL https://raw.githubusercontent.com/Jipok/jwg/master/install.sh | sudo ba
 <details>
 <summary><b>Alternative: Manual / Wireguard Setup</b> (Click to expand)</summary>
 
-`jwg` manages the *configuration logic*, but you need to run the interface process.
+`jwg` manages the *configuration logic*, but you need to run the interface process first.
 
 **Start the Interface (choose one):**
 ```bash
-# AmneziaWG (Userspace Go daemon)
+# Option 1: AmneziaWG (Userspace Go daemon)
 wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go
 chmod +x amneziawg-go
 ./amneziawg-go wg0
 
-# OR Standard Kernel WireGuard
+# Option 2: Standard Kernel WireGuard
 ip link add dev wg0 type wireguard
 ```
 
 **Initialize JWG Server:**
-Run `jwg` for the first time. It will auto-detect your Public IP and apply necessary firewall rules.
+Run `jwg` for the first time. It will auto-detect your Public IP, auto-assign a random secure port, bring the interface up, and apply necessary firewall rules.
 ```bash
 wget https://github.com/Jipok/jwg/releases/latest/download/jwg
 chmod +x jwg
@@ -67,41 +67,40 @@ jwg -add phone
 
 ## 📖 Command Reference
 
-### Managing Peers
+### Commands
 
 | Command | Description |
 | :--- | :--- |
-| `jwg -add <name>` | Add a new peer. Auto-assigns IP. |
-| `jwg -add <name> -ip 10.8.0.5/32` | Add a peer with a specific internal IP. |
-| `jwg -del <name>` | Delete a peer. |
-| `jwg -show <name>` | Display config and QR code for an existing peer. |
-| `jwg` | Show server status, used IPs, and connected peers. |
+| `jwg add <name>` | Add a new peer. Auto-assigns the next available IP. |
+| `jwg del <name>` *(or `rm`)*| Delete an existing peer. |
+| `jwg show <name>` | Display config and QR code for an existing peer. |
+| `jwg` | Show live server status, interface details, and list of connected peers. |
 
-### Configuration & Storage
+### Configuration Flags
 Flags override default settings and **persist** in the database.
 
-**Database Location:**
-`jwg` first checks for `./jwg.db`. If not found, it defaults to `/var/lib/jwg/jwg.db`. You can specify a custom path manually:
-
 ```bash
-jwg -db /etc/wireguard/my_vpn.db
-```
+# Add a peer with a specific internal IP
+jwg add phone --ip 10.8.0.5
 
-**Network Settings:**
+# Change server listening port
+jwg --port 51820
 
-```bash
-# Set custom listen port
-jwg -port 51820
+# Set custom DNS for generated client configs
+jwg --dns "1.1.1.1, 8.8.8.8"
 
-# Set custom DNS for clients
-jwg -dns "1.1.1.1, 8.8.8.8"
-
-# Force a specific endpoint (e.g. behind NAT/Cloudflare)
-jwg -endpoint "vpn.my-server.com:51820"
+# Force a specific public endpoint (e.g. behind NAT/DDNS/Cloudflare)
+jwg --endpoint "vpn.my-server.com:51820"
 
 # Change internal subnet
-jwg -subnet "192.168.100.1/24"
+jwg --subnet "192.168.100.1/24"
 ```
+
+**Advanced flags:**
+*   `--iface <name>`: Target a specific interface (default: `wg0`).
+*   `--nat-iface <name>`: Manually specify the public interface for NAT (default: auto-detected).
+*   `--client-allowed-ips <CIDR>`: Set specific `AllowedIPs` generated inside client configs (default: `0.0.0.0/0`).
+*   `--db <path>`: Check/Store the database in a custom path (defaults to `./jwg.db`, then `/var/lib/jwg/jwg.db`).
 
 ---
 
@@ -130,4 +129,4 @@ xbps-install linux-lts-headers jwg
 ln -s /etc/sv/jwg-awg0 /var/service/
 ```
 
-This gives you a pure, natively integrated WireGuard/AmneziaWG server running entirely in kernel space without systemd overhead. Just type `jwg -add client` and you're good to go.
+This gives you a pure, natively integrated WireGuard/AmneziaWG server running entirely in kernel space without systemd overhead. Just type `jwg add client` and you're good to go.
