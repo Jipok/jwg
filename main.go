@@ -306,6 +306,16 @@ func main() {
 	argDNS = config.DNS
 	argClientAllowedIPs = config.ClientAllowedIPs
 
+	// Subnet overlap protection ---
+	if err := checkSubnetOverlap(argIface, argSubnet); err != nil {
+		fmt.Printf("\n%s%s[CRITICAL ERROR] Routing Conflict Detected!%s\n", colorRed, colorBold, colorReset)
+		fmt.Printf("Details: %s\n", err.Error())
+		fmt.Printf("You are trying to assign subnet %s%s%s to interface %s%s%s.\n", colorYellow, argSubnet, colorReset, colorYellow, argIface, colorReset)
+		fmt.Printf("\n%sSolution:%s If you are setting up an additional interface (e.g., %s), you %sMUST%s provide a unique subnet!\n", colorCyan, colorReset, argIface, colorRed+colorBold, colorReset)
+		fmt.Printf("Example: %sjwg --iface %s --subnet 10.9.0.1/24 --db /path/to/db%s\n\n", colorGreen, argIface, colorReset)
+		os.Exit(1)
+	}
+
 	// Interface validation
 	if _, err := net.InterfaceByName(argIface); err != nil {
 		printMissingInterfaceHelp(argIface)
@@ -610,43 +620,42 @@ func runInitialNetworkSetup(oldPort int) {
 	checkAndConfigureQdisc(argIface)
 }
 
-// applyNftablesRules creates a dedicated table 'jwg' to handle WG traffic.
-// Included hooks:
-// 1. Filter Forward: Allows traffic in/out of WG interface.
-// 2. NAT Postrouting: Masquerades traffic going out to the internet.
+// Creates a dedicated table 'jwg_<iface>' to handle WG traffic:
+//  1. Allows traffic in/out of WG interface.
+//  2. Masquerades traffic going out to the internet.
 func applyNftablesRules(subnet, wgIface, natIface string) error {
-	// We use a priority of -5 for filter to try and run before standard firewalls (often 0),
-	// although strictly speaking, an explicit DROP in another table will still win in Netfilter.
-	// But this setup is cleaner and idempotent.
+	tableName := "jwg_" + wgIface
+
+	// We use a priority of -5 for filter to try and run before standard firewalls (often 0)
 
 	// We use a safe trick to ensure idempotency and compatibility:
 	// 1. 'add table' creates the table if it doesn't exist (no-op if it does).
 	// 2. 'delete table' flushes it and removes it.
 	// 3. The second 'add table' creates a fresh, clean table.
+
 	nftScript := fmt.Sprintf(`
-add table inet jwg_filter
-delete table inet jwg_filter
+# 1. Idempotency Trick: blindly add, delete (flush), then add cleanly
+add table ip %[1]s
+delete table ip %[1]s
+add table ip %[1]s
 
-add table inet jwg_filter
-add chain inet jwg_filter forward { type filter hook forward priority -5; policy accept; }
+# 2. Filter Chain (Forwarding)
+# Priority -5 ensures this runs slightly before default filter rules (usually 0)
+add chain ip %[1]s forward { type filter hook forward priority -5; policy accept; }
 
-# Allow traffic from WG to Internet
-add rule inet jwg_filter forward iifname "%s" oifname "%s" counter accept
+# Allow outbound traffic from WG out to the external interface
+add rule ip %[1]s forward iifname "%[2]s" oifname "%[3]s" counter accept
 
-# Allow return traffic (established/related)
-add rule inet jwg_filter forward iifname "%s" oifname "%s" ct state related,established counter accept
+# Allow inbound return traffic (established/related) from the external interface back to WG
+add rule ip %[1]s forward iifname "%[3]s" oifname "%[2]s" ct state related,established counter accept
 
+# 3. NAT Chain (Masquerade)
+# Priority 100 is standard for postrouting source NAT
+add chain ip %[1]s postrouting { type nat hook postrouting priority 100; policy accept; }
 
-# Define table for NAT (IPv4 only usually needed for masquerade here)
-add table ip jwg_nat
-delete table ip jwg_nat
-
-add table ip jwg_nat
-add chain ip jwg_nat postrouting { type nat hook postrouting priority 100; policy accept; }
-
-# Masquerade traffic from WG subnet going out via NAT interface
-add rule ip jwg_nat postrouting oifname "%s" ip saddr %s counter masquerade
-`, wgIface, natIface, natIface, wgIface, natIface, subnet)
+# Masquerade (SNAT) traffic originating from the WG subnet going out to the Internet
+add rule ip %[1]s postrouting oifname "%[3]s" ip saddr %[4]s counter masquerade
+`, tableName, wgIface, natIface, subnet)
 
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = bytes.NewBufferString(nftScript)
@@ -775,6 +784,57 @@ func checkAndConfigureQdisc(wgIface string) {
 	cakeErrStr := strings.TrimSpace(strings.ReplaceAll(string(cakeOut), "\n", " "))
 	fqErrStr := strings.TrimSpace(strings.ReplaceAll(string(fqOut), "\n", " "))
 	fmt.Printf("      %sDetails%s -> CAKE: %s | FQ_CODEL: %s\n", colorBold, colorReset, cakeErrStr, fqErrStr)
+}
+
+// Verifies if the requested subnet is already in use by another interface on the system to prevent routing conflicts.
+func checkSubnetOverlap(targetIface, targetSubnet string) error {
+	targetPrefix, err := netip.ParsePrefix(targetSubnet)
+	if err != nil {
+		return fmt.Errorf("invalid subnet format '%s': %v", targetSubnet, err)
+	}
+	// Normalize to discard host bits (e.g., 10.8.0.1/24 -> 10.8.0.0/24)
+	targetNet := targetPrefix.Masked()
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("failed to list network interfaces: %v", err)
+	}
+
+	for _, iface := range ifaces {
+		// Skip the target interface itself (it might be updating its own IP) and loopback interfaces
+		if iface.Name == targetIface || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			// net.Addr string format is like "192.168.1.5/24"
+			sysPrefix, err := netip.ParsePrefix(addr.String())
+			if err != nil {
+				continue
+			}
+
+			// Only compare IPv4 with IPv4, and IPv6 with IPv6
+			if sysPrefix.Addr().Is4() != targetPrefix.Addr().Is4() {
+				continue
+			}
+
+			sysNet := sysPrefix.Masked()
+
+			// Check for overlap:
+			// 1. Exact match (targetNet == sysNet)
+			// 2. Target subnet is broader and contains system IP
+			// 3. System subnet is broader and contains target IP
+			if targetNet == sysNet || targetNet.Contains(sysPrefix.Addr()) || sysNet.Contains(targetPrefix.Addr()) {
+				return fmt.Errorf("interface '%s' is already using overlapping address %s", iface.Name, addr.String())
+			}
+		}
+	}
+	return nil
 }
 
 // runCmd is a helper to execute shell commands and log their output.
