@@ -598,6 +598,7 @@ func runInitialNetworkSetup() {
 
 	checkAndFixIptablesZombieRules(argIface)
 	checkAndConfigureUFW(argPort, argIface, argNatIface)
+	checkAndConfigureQdisc(argIface)
 }
 
 // applyNftablesRules creates a dedicated table 'jwg' to handle WG traffic.
@@ -714,6 +715,51 @@ func checkAndFixIptablesZombieRules(wgIface string) {
 
 	ensureIptablesRule("-i") // Ingress
 	ensureIptablesRule("-o") // Egress
+}
+
+// Applies network packet scheduling (QoS/Smart Queue Management).
+// Specifically, it mitigates Bufferbloat and ensures Fair Queueing (FQ) between peers.
+// By applying this to the 'wg' interface (which handles raw, unencrypted internal IPs),
+// we ensure that a single peer doing heavy transfers (e.g., torrents) doesn't spike
+// the latency (ping) of other peers.
+func checkAndConfigureQdisc(wgIface string) {
+	fmt.Printf("  %s[NETWORK]%s Optimizing queue management (Anti-Bufferbloat) on %s...\n", colorCyan, colorReset, wgIface)
+
+	// 'tc' is part of the iproute2 package (already checked in main, but safe to verify).
+	if _, err := exec.LookPath("tc"); err != nil {
+		fmt.Printf("    %s[WARN]%s `tc` not found. QOS skipped\n", colorYellow, colorReset)
+		return
+	}
+
+	// --- 1. Try applying CAKE ---
+	// We use 'besteffort' for general fairness without explicit bandwidth limits.
+	// Note: We deliberately omit the 'nat' keyword here. Since this is applied to
+	// the WireGuard interface and not the external WAN interface, traffic is evaluated
+	// based on inner VPN IP addresses (e.g., 10.8.0.x), so NAT traversal logic is unnecessary.
+	cmdCake := exec.Command("tc", "qdisc", "replace", "dev", wgIface, "root", "cake", "besteffort")
+	cakeOut, err := cmdCake.CombinedOutput()
+
+	if err == nil {
+		fmt.Printf("    - Added CAKE qdisc (ensures active fairness between peers)\n")
+		return
+	}
+
+	// --- 2. Fallback to FQ_CODEL ---
+	// If the kernel lacks the 'sch_cake' module (e.g., older kernels), fq_codel is the next best choice.
+	cmdFq := exec.Command("tc", "qdisc", "replace", "dev", wgIface, "root", "fq_codel")
+	fqOut, err := cmdFq.CombinedOutput()
+
+	if err == nil {
+		fmt.Printf("    - Added FQ_CODEL qdisc (fallback from CAKE)\n")
+		return
+	}
+
+	// --- 3. Both failed ---
+	fmt.Printf("    %s[WARN]%s Advanced Queue Management blocked by host system (likely LXC/OpenVZ).\n", colorYellow, colorReset)
+
+	cakeErrStr := strings.TrimSpace(strings.ReplaceAll(string(cakeOut), "\n", " "))
+	fqErrStr := strings.TrimSpace(strings.ReplaceAll(string(fqOut), "\n", " "))
+	fmt.Printf("      %sDetails%s -> CAKE: %s | FQ_CODEL: %s\n", colorBold, colorReset, cakeErrStr, fqErrStr)
 }
 
 // runCmd is a helper to execute shell commands and log their output.
