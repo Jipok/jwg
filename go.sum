@@ -4,6 +4,8 @@ github.com/Jipok/wgctrl-go v1.1.0 h1:XZXuXuqqDq1XFllR7aYka+ucHVKSssraYZP/8+1DhqY
 github.com/Jipok/wgctrl-go v1.1.0/go.mod h1:GrJJ7jsDCnIgf2t9mjYNF7KxmOT6codxbglM1XJx1K8=
 github.com/Jipok/wgctrl-go v1.1.1 h1:2a4scbjGZ6kACYmOGN/gWZ81en6G/r5dq7YHYQQUG0c=
 github.com/Jipok/wgctrl-go v1.1.1/go.mod h1:GrJJ7jsDCnIgf2t9mjYNF7KxmOT6codxbglM1XJx1K8=
+github.com/Jipok/wgctrl-go v1.2.0 h1:iASpMg0Urceh/B+ZXUsZcVt8vfsbk7KjpS7wSS9X91I=
+github.com/Jipok/wgctrl-go v1.2.0/go.mod h1:GrJJ7jsDCnIgf2t9mjYNF7KxmOT6codxbglM1XJx1K8=
 github.com/goccy/go-json v0.10.5 h1:Fq85nIqj+gXn/S5ahsiTlK3TmC85qgirsdTP/+DeaC4=
 github.com/goccy/go-json v0.10.5/go.mod h1:oq7eo15ShAhp70Anwd5lgX2pLfOS3QCiwU/PULtXL6M=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=

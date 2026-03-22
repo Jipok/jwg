@@ -67,6 +67,7 @@ var (
 	argDNS              string
 	argClientAllowedIPs string
 	argDBPath           string
+	argAmnezI1          string
 )
 
 // Persistent configuration
@@ -124,6 +125,7 @@ func main() {
 	pflag.StringVar(&argDNS, "dns", defaultDNS, "DNS servers for client configs")
 	pflag.StringVar(&argClientAllowedIPs, "client-allowed-ips", defaultClientAllowedIPs, "AllowedIPs range inside generated client configs")
 	pflag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
+	pflag.StringVar(&argAmnezI1, "i1", "", "AmneziaWG I1 parameter (custom init packet magic, e.g. for protocol emulation)")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [command] [flags]\n\n", os.Args[0])
@@ -292,6 +294,11 @@ func main() {
 	if isFlagPassed("client-allowed-ips") {
 		config.ClientAllowedIPs = argClientAllowedIPs
 		configDirty = true
+	}
+	if isFlagPassed("i1") {
+		config.AmnezI1 = argAmnezI1
+		configDirty = true
+		fmt.Printf("%s[OK]%s AmneziaWG I1 parameter set to: %s%s%s\n", colorGreen, colorReset, colorBold, config.AmnezI1, colorReset)
 	}
 	if isFlagPassed("endpoint") {
 		_, _, err := net.SplitHostPort(argEndpoint)

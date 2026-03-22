@@ -93,6 +93,6 @@ echo -e "${GREEN}JWG has been successfully installed and started!${NC}"
 echo -e "${GREEN}====================================================${NC}"
 echo ""
 echo "You can now add your first user by running:"
-echo "  jwg -add phone"
+echo "  jwg add MyPhone"
 echo ""
 
