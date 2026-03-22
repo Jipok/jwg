@@ -162,6 +162,7 @@ func main() {
 		}
 	case "":
 		// Default sync/info mode
+	case "list":
 	default:
 		log.Fatalf("%s[ERR]%s Unknown command '%s'. Valid commands are: add, del, show", colorRed, colorReset, command)
 	}
@@ -185,7 +186,9 @@ func main() {
 	// --- Persistence/Config Logic ---
 
 	dbPath := resolveDBPath(argDBPath)
-	fmt.Printf("%s[INFO]%s Using database: %s\n", colorCyan, colorReset, dbPath)
+	if command != "list" {
+		fmt.Printf("%s[INFO]%s Using database: %s\n", colorCyan, colorReset, dbPath)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
 		log.Fatalf("Failed to create directory for database at %s: %v", filepath.Dir(dbPath), err)
@@ -211,6 +214,14 @@ func main() {
 	config, err = persist.Get[ServerConfig](store, dbMapKeyServerConfig)
 	if err != nil && err != persist.ErrKeyNotFound {
 		log.Fatalf("failed to read server config map: %v", err)
+	}
+
+	if command == "list" {
+		peerDataMap.Range(func(key string, peer PeerData) bool {
+			fmt.Println(key)
+			return true
+		})
+		return
 	}
 
 	// Flag to track if we need to save updates to the DB

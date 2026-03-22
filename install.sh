@@ -18,8 +18,10 @@ echo "Starting JWG installation..."
 # 2. Define download URLs (assumes architecture is AMD64, adjust if multi-arch is needed)
 JWG_URL="https://github.com/Jipok/jwg/releases/latest/download/jwg"
 AWG_GO_URL="https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go"
+COMPLETION_URL="https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/jwg-completion.bash"
 
 BIN_DIR="/usr/local/bin"
+COMPLETION_DIR="/etc/bash_completion.d"
 
 # 3. Download binaries
 echo "Downloading amneziawg-go (userspace daemon)..."
@@ -33,6 +35,13 @@ chmod +x "$BIN_DIR/amneziawg-go"
 chmod +x "$BIN_DIR/jwg"
 
 echo -e "${GREEN}Binaries successfully installed to $BIN_DIR${NC}"
+
+# 4a. Install bash completion
+if [ -d "$COMPLETION_DIR" ]; then
+    echo "Installing bash completion..."
+    curl -sL "$COMPLETION_URL" -o "$COMPLETION_DIR/jwg"
+    echo -e "${GREEN}Bash completion installed. Re-open your shell or run: source $COMPLETION_DIR/jwg${NC}"
+fi
 
 # 5. Check init system. Respect non-systemd distros (Void, Alpine, etc.)
 if ! command -v systemctl >/dev/null 2>&1; then
