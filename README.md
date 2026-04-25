@@ -106,6 +106,8 @@ jwg --subnet "192.168.100.1/24"
 💡 **Geo-blocking to prevent VPN detection**
 ```bash
 sudo wget https://country-ip-blocks.hackinggate.com/RU_IPv4.txt -O /var/lib/jwg/RU_IPv4.txt
+# Fix habr
+sudo sed -i '/^178\.248\.23/d' /var/lib/jwg/RU_IPv4.txt
 sudo jwg --blocklist /var/lib/jwg/RU_IPv4.txt
 ```
 *(To disable the blocklist later, simply run `sudo jwg --blocklist ""`)*
