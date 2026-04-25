@@ -68,6 +68,7 @@ var (
 	argClientAllowedIPs string
 	argDBPath           string
 	argAmnezI1          string
+	argBlockFile        string
 )
 
 // Persistent configuration
@@ -80,6 +81,7 @@ type ServerConfig struct {
 	DNS              string
 	ClientAllowedIPs string
 	Interface        string
+	BlockFile        string
 
 	// --- AmneziaWG Specific Params ---
 	// If 0 or empty, they are considered unset.
@@ -125,6 +127,7 @@ func main() {
 	pflag.StringVar(&argDNS, "dns", defaultDNS, "DNS servers for client configs")
 	pflag.StringVar(&argClientAllowedIPs, "client-allowed-ips", defaultClientAllowedIPs, "AllowedIPs range inside generated client configs")
 	pflag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
+	pflag.StringVar(&argBlockFile, "blocklist", "", "Optional: Path to a file containing CIDR subnets/IPs to block")
 	pflag.StringVar(&argAmnezI1, "i1", "", "AmneziaWG I1 parameter (custom init packet magic, e.g. for protocol emulation)")
 
 	pflag.Usage = func() {
@@ -320,6 +323,16 @@ func main() {
 		configDirty = true
 		fmt.Printf("%s[OK]%s Manual endpoint set via flag: %s%s%s\n", colorGreen, colorReset, colorBold, config.Endpoint, colorReset)
 	}
+	if isFlagPassed("blocklist") {
+		config.BlockFile = argBlockFile
+		configDirty = true
+		firewallDirty = true
+		if argBlockFile == "" {
+			fmt.Printf("%s[OK]%s IP blocklist disabled (cleared).\n", colorGreen, colorReset)
+		} else {
+			fmt.Printf("%s[OK]%s IP blocklist file set to: %s%s%s\n", colorGreen, colorReset, colorBold, config.BlockFile, colorReset)
+		}
+	}
 
 	// Sync "Global Args" with "Config State"
 	argIface = config.Interface
@@ -328,6 +341,7 @@ func main() {
 	argNatIface = config.NatIface
 	argDNS = config.DNS
 	argClientAllowedIPs = config.ClientAllowedIPs
+	argBlockFile = config.BlockFile
 
 	// Subnet overlap protection ---
 	if err := checkSubnetOverlap(argIface, argSubnet); err != nil {
@@ -456,7 +470,7 @@ func main() {
 		}
 
 		// Re-apply firewall rules
-		if err := applyNftablesRules(argSubnet, argIface, argNatIface); err != nil {
+		if err := applyNftablesRules(argSubnet, argIface, argNatIface, argBlockFile); err != nil {
 			log.Fatalf("Failed to apply nftables configuration: %v", err)
 		}
 		checkAndFixIptablesZombieRules(argIface)
@@ -656,10 +670,10 @@ func runInitialNetworkSetup(oldPort int) {
 	// Step 4: Firewall Configuration (NFTables)
 	fmt.Printf("  %s[FIREWALL]%s Configuring nftables rules (NAT & Forwarding)...\n", colorYellow, colorReset)
 
-	if err := applyNftablesRules(argSubnet, argIface, argNatIface); err != nil {
+	if err := applyNftablesRules(argSubnet, argIface, argNatIface, argBlockFile); err != nil {
 		log.Fatalf("Failed to apply nftables configuration: %v", err)
 	}
-	fmt.Printf("    %s[OK]%s Nftables rules applied to table 'jwg'.\n", colorGreen, colorReset)
+	fmt.Printf("    %s[OK]%s Nftables rules applied to table 'jwg_%s'.\n", colorGreen, colorReset, argIface)
 
 	checkAndFixIptablesZombieRules(argIface)
 	checkAndConfigureUFW(oldPort, argPort, argIface, argNatIface)
@@ -669,8 +683,25 @@ func runInitialNetworkSetup(oldPort int) {
 // Creates a dedicated table 'jwg_<iface>' to handle WG traffic:
 //  1. Allows traffic in/out of WG interface.
 //  2. Masquerades traffic going out to the internet.
-func applyNftablesRules(subnet, wgIface, natIface string) error {
+func applyNftablesRules(subnet, wgIface, natIface, blockFile string) error {
 	tableName := "jwg_" + wgIface
+
+	var blocklistScript string
+	if blockFile != "" {
+		cidrs, err := parseBlockFile(blockFile)
+		if err != nil {
+			fmt.Printf("  %s[WARN]%s Failed to read block file '%s': %v\n", colorYellow, colorReset, blockFile, err)
+		} else if len(cidrs) > 0 {
+			fmt.Printf("  %s[FIREWALL]%s Loaded %d IPv4 subnets from block file.\n", colorCyan, colorReset, len(cidrs))
+
+			blocklistScript = fmt.Sprintf(`
+# GeoIP / Blocklist Rules
+add set ip %[1]s blocked_ips { type ipv4_addr; flags interval; auto-merge; }
+add element ip %[1]s blocked_ips { %[2]s }
+add rule ip %[1]s forward iifname "%[3]s" ip daddr @blocked_ips counter drop
+`, tableName, strings.Join(cidrs, ", "), wgIface)
+		}
+	}
 
 	// We use a priority of -5 for filter to try and run before standard firewalls (often 0)
 
@@ -689,6 +720,9 @@ add table ip %[1]s
 # Priority -5 ensures this runs slightly before default filter rules (usually 0)
 add chain ip %[1]s forward { type filter hook forward priority -5; policy accept; }
 
+# Blocklist Rules
+%[5]s
+
 # Allow outbound traffic from WG out to the external interface
 add rule ip %[1]s forward iifname "%[2]s" oifname "%[3]s" counter accept
 
@@ -701,7 +735,7 @@ add chain ip %[1]s postrouting { type nat hook postrouting priority 100; policy 
 
 # Masquerade (SNAT) traffic originating from the WG subnet going out to the Internet
 add rule ip %[1]s postrouting oifname "%[3]s" ip saddr %[4]s counter masquerade
-`, tableName, wgIface, natIface, subnet)
+`, tableName, wgIface, natIface, subnet, blocklistScript)
 
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = bytes.NewBufferString(nftScript)
@@ -712,6 +746,44 @@ add rule ip %[1]s postrouting oifname "%[3]s" ip saddr %[4]s counter masquerade
 	}
 
 	return nil
+}
+
+func parseBlockFile(path string) ([]string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var validCIDRs []string
+	lines := strings.Split(string(content), "\n")
+
+	for _, line := range lines {
+		if idx := strings.Index(line, "#"); idx != -1 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Parse CIDR
+		if prefix, err := netip.ParsePrefix(line); err == nil {
+			if prefix.Addr().Is4() {
+				validCIDRs = append(validCIDRs, prefix.String())
+			}
+			continue
+		}
+
+		// Parse solo IP
+		if ip, err := netip.ParseAddr(line); err == nil {
+			if ip.Is4() {
+				validCIDRs = append(validCIDRs, ip.String()+"/32")
+			}
+			continue
+		}
+		fmt.Printf("    %s[WARN]%s Invalid IP/CIDR ignored in blocklist: '%s'\n", colorYellow, colorReset, line)
+	}
+
+	return validCIDRs, nil
 }
 
 // Ensures UFW allows both the listening port and the forwarding of traffic from WireGuard to the internet.

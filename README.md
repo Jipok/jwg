@@ -101,6 +101,14 @@ jwg --subnet "192.168.100.1/24"
 *   `--nat-iface <name>`: Manually specify the public interface for NAT (default: auto-detected).
 *   `--client-allowed-ips <CIDR>`: Set specific `AllowedIPs` generated inside client configs (default: `0.0.0.0/0`).
 *   `--db <path>`: Check/Store the database in a custom path (defaults to `./jwg.db`, then `/var/lib/jwg/jwg.db`).
+*   `--blocklist <path>`: Path to a plain-text file with IPs/CIDRs to drop server-side via nftables.
+
+💡 **Geo-blocking to prevent VPN detection**
+```bash
+sudo wget https://country-ip-blocks.hackinggate.com/RU_IPv4.txt -O /var/lib/jwg/RU_IPv4.txt
+sudo jwg --blocklist /var/lib/jwg/RU_IPv4.txt
+```
+*(To disable the blocklist later, simply run `sudo jwg --blocklist ""`)*
 
 ---
 
