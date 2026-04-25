@@ -315,13 +315,19 @@ func main() {
 		fmt.Printf("%s[OK]%s AmneziaWG I1 parameter set to: %s%s%s\n", colorGreen, colorReset, colorBold, config.AmnezI1, colorReset)
 	}
 	if isFlagPassed("endpoint") {
-		_, _, err := net.SplitHostPort(argEndpoint)
-		if err != nil { // Empty port
-			argEndpoint = net.JoinHostPort(argEndpoint, fmt.Sprintf("%d", argPort))
+		if argEndpoint == "" {
+			config.Endpoint = ""
+			configDirty = true
+			fmt.Printf("%s[OK]%s Endpoint reset. Will auto-detect public IP.\n", colorGreen, colorReset)
+		} else {
+			_, _, err := net.SplitHostPort(argEndpoint)
+			if err != nil { // Empty port
+				argEndpoint = net.JoinHostPort(argEndpoint, fmt.Sprintf("%d", argPort))
+			}
+			config.Endpoint = argEndpoint
+			configDirty = true
+			fmt.Printf("%s[OK]%s Manual endpoint set via flag: %s%s%s\n", colorGreen, colorReset, colorBold, config.Endpoint, colorReset)
 		}
-		config.Endpoint = argEndpoint
-		configDirty = true
-		fmt.Printf("%s[OK]%s Manual endpoint set via flag: %s%s%s\n", colorGreen, colorReset, colorBold, config.Endpoint, colorReset)
 	}
 	if isFlagPassed("blocklist") {
 		config.BlockFile = argBlockFile
