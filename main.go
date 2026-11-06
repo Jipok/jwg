@@ -69,6 +69,7 @@ var (
 	argClientAllowedIPs string
 	argDBPath           string
 	argAmnezI1          string
+	argAmnezVersion     string
 	argBlockFile        string
 )
 
@@ -145,6 +146,7 @@ func main() {
 	pflag.StringVar(&argDBPath, "db", "", "Path to the database file (default checks ./jwg.db then /var/lib/jwg/jwg.db)")
 	pflag.StringVar(&argBlockFile, "blocklist", "", "Optional: Path to a file containing CIDR subnets/IPs to block")
 	pflag.StringVar(&argAmnezI1, "i1", "", "AmneziaWG I1 parameter (custom init packet magic, e.g. for protocol emulation)")
+	pflag.StringVar(&argAmnezVersion, "awg-version", "", "AmneziaWG profile version to generate (1.5, 2.0, 3.0, 3.1; default: 2.0)")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [command] [flags]\n\n", os.Args[0])
@@ -155,6 +157,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  <none>        Sync server configuration and show status\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		pflag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nBlocklist example (drop RU traffic to prevent server IP leaks):\n")
+		fmt.Fprintf(os.Stderr, "  wget -qO /var/lib/jwg/RU_IPv4.txt https://country-ip-blocks.hackinggate.com/RU_IPv4.txt && sed -i '/^178\\.248\\.23/d' /var/lib/jwg/RU_IPv4.txt && jwg --blocklist /var/lib/jwg/RU_IPv4.txt\n")
 	}
 
 	pflag.Parse()
@@ -200,6 +204,15 @@ func main() {
 
 	if argPeerIP != "" && command != "add" {
 		log.Fatalf("The --ip flag can only be used when adding a new peer with the 'add' command.")
+	}
+
+	var requestedAmnezVer wgtypes.AmneziaVersion
+	if isFlagPassed("awg-version") {
+		var err error
+		requestedAmnezVer, err = parseAmneziaVersion(argAmnezVersion)
+		if err != nil {
+			log.Fatalf("%s[ERR]%s %v", colorRed, colorReset, err)
+		}
 	}
 
 	// --- Persistence/Config Logic ---
@@ -391,41 +404,65 @@ func main() {
 	// --- AMNEZIA DETECTION & CONFIG ---
 	isAmneziaDevice := false
 	amnezVer := wgtypes.AWGNone
-	// What the interface itself supports, before the stored profile is taken
-	// into account. Kept apart from amnezVer because the upgrade notice has to
-	// compare the two, and amnezVer may be lowered to the stored profile below.
-	// deviceVerKnown guards that notice: a userspace daemon only reports a lower
-	// bound, so its reading must not be taken for a generation it may not have.
 	deviceVer := wgtypes.AWGNone
-	deviceVerKnown := false
 	probed := false
 	if d, err := wgClient.Device(argIface); err == nil {
 		if d.IsAmnezia {
 			isAmneziaDevice = true
-			amnezVer = d.AmneziaVersion
 			deviceVer = d.AmneziaVersion
-			// The kernel states its generation exactly. A userspace daemon does
-			// not: 1.5 is indistinguishable from 2.0 there, and the 3.0 keys
-			// stay invisible until something sets them, so a stale profile
-			// makes the daemon look older than it is. Only 3.1 advertises
-			// itself unconditionally, and a probe asks the daemon directly.
-			deviceVerKnown = d.Type != wgtypes.Userspace || amnezVer == wgtypes.AWG31
 
 			freshDB := config.AmnezJc == 0 || config.AmnezH1 == ""
-			// Probing writes to the device, so never do it for read-only commands
-			if freshDB && command != "show" && d.Type == wgtypes.Userspace {
-				amnezVer = probeAmneziaVersion(argIface)
-				deviceVer = amnezVer
-				deviceVerKnown = true
-				probed = true
-			} else if !freshDB && storedAmnezVersion() < amnezVer {
-				// With a database already in place, the stored profile is the
-				// truth: a userspace 1.5 daemon is indistinguishable from 2.0 and
-				// must not be reported as more capable than it is.
-				amnezVer = storedAmnezVersion()
+			if !freshDB && requestedAmnezVer != wgtypes.AWGNone && requestedAmnezVer != storedAmnezVersion() {
+				log.Fatalf("%s[ERR]%s Cannot change AmneziaWG profile version on an existing database (stored: %s, requested: %s) — this would break all existing client configs.\n   To re-initialize from scratch, delete %s first.",
+					colorRed, colorReset, storedAmnezVersion(), requestedAmnezVer, dbPath)
 			}
 
-			fmt.Printf("%s[AMNEZIA]%s Detected AmneziaWG %s%s%s interface.\n", colorPurple, colorReset, colorBold, amnezVer, colorReset)
+			wantVer := wgtypes.AWG20
+			if requestedAmnezVer != wgtypes.AWGNone {
+				wantVer = requestedAmnezVer
+			}
+
+			// Probing writes to the device, so never do it for read-only commands.
+			// Only probe up to wantVer so 3.x attributes (HeaderProtectionKey,
+			// RandomTrailers) are never enabled on a userspace daemon that will
+			// run a 2.0 profile.
+			if freshDB && command != "show" && d.Type == wgtypes.Userspace {
+				deviceVer = probeAmneziaVersion(argIface, wantVer)
+				probed = true
+			}
+
+			if freshDB && requestedAmnezVer != wgtypes.AWGNone && requestedAmnezVer > deviceVer {
+				log.Fatalf("%s[ERR]%s Interface %s only supports AmneziaWG up to %s (requested %s).",
+					colorRed, colorReset, argIface, deviceVer, requestedAmnezVer)
+			}
+
+			// A fresh database gets the wanted profile, capped by what the device
+			// supports. An existing database keeps its stored profile as is: the
+			// clients already hold those parameters, so silently applying a lower
+			// generation would only break every tunnel without any error.
+			if freshDB {
+				amnezVer = min(wantVer, deviceVer)
+			} else {
+				amnezVer = storedAmnezVersion()
+				// The kernel reports its generation exactly, and wgctrl drops
+				// attributes the netlink family does not know, so fail loudly.
+				// A userspace daemon only reports a lower bound (a restarted 3.0
+				// daemon looks like 2.0), so the stored profile is applied as is
+				// and a daemon that truly lacks it rejects it with errno=-22.
+				if d.Type != wgtypes.Userspace && amnezVer > deviceVer {
+					log.Fatalf("%s[ERR]%s Interface %s runs AmneziaWG %s, but the database holds a %s profile that all client configs depend on.\n"+
+						"   Upgrade the amneziawg kernel module, or start over with a new database: %srm %s%s",
+						colorRed, colorReset, argIface, deviceVer, amnezVer, colorCyan, dbPath, colorReset)
+				}
+			}
+
+			if amnezVer < deviceVer {
+				fmt.Printf("%s[AMNEZIA]%s Detected AmneziaWG %s%s%s interface (active profile: %s%s%s).\n",
+					colorPurple, colorReset, colorBold, deviceVer, colorReset, colorBold, amnezVer, colorReset)
+			} else {
+				fmt.Printf("%s[AMNEZIA]%s Detected AmneziaWG %s%s%s interface.\n",
+					colorPurple, colorReset, colorBold, amnezVer, colorReset)
+			}
 
 			// Generate parameters only for a fresh database
 			if freshDB {
@@ -478,6 +515,9 @@ func main() {
 			if isFlagPassed("i1") {
 				config.AmnezI1 = argAmnezI1
 			}
+		} else if requestedAmnezVer != wgtypes.AWGNone {
+			log.Fatalf("%s[ERR]%s Interface %s is standard WireGuard and does not support AmneziaWG parameters.",
+				colorRed, colorReset, argIface)
 		}
 	}
 
@@ -507,18 +547,8 @@ func main() {
 		}
 	}
 
-	// Warn when the stored parameters are older than the running interface.
-	// Databases written before the version field existed are inferred from the
-	// header shape: a single value means 1.5, a range means 2.0.
-	// Compare against the device rather than amnezVer, which may have been
-	// lowered to the stored profile simply to keep an older device working, and
-	// only when the device's own generation is actually known.
-	cfgVer := storedAmnezVersion()
-	if config.AmnezH1 != "" && deviceVerKnown && cfgVer < deviceVer {
-		printAmneziaUpgradeAlert(cfgVer, deviceVer, dbPath)
-	}
-
 	// Apply using the stored profile when it is older than the device. A newer device accepts older parameters
+	cfgVer := storedAmnezVersion()
 	applyVer := amnezVer
 	if cfgVer != wgtypes.AWGNone && cfgVer < applyVer {
 		applyVer = cfgVer
@@ -530,6 +560,10 @@ func main() {
 		return // Early exit, no sync required for Show
 	}
 	if command == "add" {
+		if config.BlockFile == "" {
+			fmt.Printf("%s[WARN]%s No IP blocklist configured (--blocklist). Server IP may be exposed if clients route domestic traffic.\n", colorYellow, colorReset)
+			fmt.Printf("  %sExample:%s wget -qO /var/lib/jwg/RU_IPv4.txt https://country-ip-blocks.hackinggate.com/RU_IPv4.txt && sed -i '/^178\\.248\\.23/d' /var/lib/jwg/RU_IPv4.txt && jwg --blocklist /var/lib/jwg/RU_IPv4.txt\n", colorCyan, colorReset)
+		}
 		runAddPeer(peerName)
 	}
 	if command == "del" || command == "rm" {
@@ -541,6 +575,33 @@ func main() {
 	// A successful probe leaves its test values on the device, so a full sync must follow to overwrite them with the real profile
 	if probed {
 		mutatingAction = true
+	}
+
+	if d, err := wgClient.Device(argIface); err == nil {
+		// If the live listen port differs from the database (e.g. a fresh DB
+		// replaced an existing one on an already-configured interface), make
+		// sure UFW/firewall rules replace the old port with the new one.
+		if d.ListenPort != 0 && d.ListenPort != argPort {
+			if oldPort == 0 {
+				oldPort = d.ListenPort
+			}
+			if !firewallDirty {
+				fmt.Printf("%s[CONF]%s Live listen port (%d) mismatches config (%d).\n", colorYellow, colorReset, d.ListenPort, argPort)
+				firewallDirty = true
+			}
+		}
+
+		// The kernel module cannot clear has_protection once HeaderProtectionKey is
+		// set (header_protection.c:35). If the interface still holds a 3.x key from
+		// a previous database while we are applying a 1.5/2.0 profile, recreate the
+		// link so runInitialNetworkSetup reconfigures a clean interface below.
+		if isAmneziaDevice && applyVer < wgtypes.AWG30 && d.Type == wgtypes.LinuxKernel && d.HeaderProtectionKey != nil {
+			fmt.Printf("%s[WARN]%s Recreating %s to clear sticky 3.x HeaderProtectionKey from kernel...\n", colorYellow, colorReset, argIface)
+			_ = runCmd("ip", "link", "del", "dev", argIface)
+			if err := runCmd("ip", "link", "add", "dev", argIface, "type", "amneziawg"); err != nil {
+				log.Fatalf("Failed to recreate interface %s: %v", argIface, err)
+			}
+		}
 	}
 
 	// Check environment and configure firewall/interfaces
@@ -1346,8 +1407,9 @@ func printClientConfig(peerName string, peerData PeerData, serverPublicKey wgtyp
 			amneziaParamsBuilder.WriteString(fmt.Sprintf("I1 = %s\n", config.AmnezI1))
 		}
 
-		// AmneziaWG 3.x additions. Clients older than 3.0 reject these keys, so they are only emitted for 3.x interfaces
-		if config.AmnezVersion >= wgtypes.AWG30 {
+		// AmneziaWG 3.x additions. Clients older than 3.0 reject these keys, so they are only emitted for 3.x profiles
+		cfgVer := storedAmnezVersion()
+		if cfgVer >= wgtypes.AWG30 {
 			if config.AmnezHeaderProtectionKey != "" {
 				amneziaParamsBuilder.WriteString(fmt.Sprintf("HeaderProtectionKey = %s\n", config.AmnezHeaderProtectionKey))
 			}
@@ -1366,7 +1428,7 @@ func printClientConfig(peerName string, peerData PeerData, serverPublicKey wgtyp
 					amneziaParamsBuilder.WriteString(fmt.Sprintf("%s = %s\n", kv.key, kv.val))
 				}
 			}
-			if config.AmnezVersion >= wgtypes.AWG31 {
+			if cfgVer >= wgtypes.AWG31 {
 				amneziaParamsBuilder.WriteString(fmt.Sprintf("RandomTrailers = %s\n", onOff(config.AmnezRandomTrailers)))
 				amneziaParamsBuilder.WriteString(fmt.Sprintf("DisableCookies = %s\n", onOff(config.AmnezDisableCookies)))
 			}
@@ -1505,7 +1567,7 @@ func printDeviceDetails(d *wgtypes.Device) {
 		if d.HeaderProtectionKey != nil {
 			printInfo("HeaderProt", colorGreen+"enabled"+colorReset)
 		}
-		if d.ContentPaddingAddition != nil {
+		if d.ContentPaddingAddition != nil && !d.ContentPaddingAddition.IsZero() {
 			printInfo("ContentPad", d.ContentPaddingAddition.String())
 		}
 		if d.RandomTrailers {
@@ -1514,6 +1576,12 @@ func printDeviceDetails(d *wgtypes.Device) {
 		if d.DisableCookies {
 			printInfo("DisCookies", colorGreen+"on"+colorReset)
 		}
+	}
+
+	if config.BlockFile != "" {
+		printInfo("Blocklist", colorGreen+config.BlockFile+colorReset)
+	} else {
+		printInfo("Blocklist", colorYellow+"none (use --blocklist to prevent geo IP leaks)"+colorReset)
 	}
 }
 
@@ -1610,22 +1678,20 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.2f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// The database is the only thing that has to change: deleting it regenerates everything on the next run.
-func printAmneziaUpgradeAlert(have, want wgtypes.AmneziaVersion, dbPath string) {
-	fmt.Printf("\n%s%s======================================================================%s\n", colorRed, colorBold, colorReset)
-	fmt.Printf("%s%s[WARNING] OUTDATED AMNEZIA WG PARAMETERS%s\n\n", colorRed, colorBold, colorReset)
-
-	fmt.Printf("Your interface runs AmneziaWG %s%s%s, but the stored parameters are %s%s%s.\n",
-		colorBold, want, colorReset, colorYellow, have, colorReset)
-	fmt.Printf("They still work, but they miss the newer DPI-resistance features and\n")
-	fmt.Printf("may be vulnerable to heuristic blocking.\n\n")
-
-	fmt.Printf("How to upgrade:\n")
-	fmt.Printf("1. Delete the current database (this will reset the server keys and peers).\n")
-	fmt.Printf("   %srm %s%s\n", colorCyan, dbPath, colorReset)
-	fmt.Printf("2. Run this tool again to generate a fresh, secure configuration.\n")
-	fmt.Printf("3. Add your peers and scan the new QR codes on all devices.\n")
-	fmt.Printf("%s%s======================================================================%s\n\n", colorRed, colorBold, colorReset)
+// parseAmneziaVersion parses user-supplied --awg-version strings.
+func parseAmneziaVersion(s string) (wgtypes.AmneziaVersion, error) {
+	switch strings.TrimSpace(s) {
+	case "1.5":
+		return wgtypes.AWG15, nil
+	case "2", "2.0":
+		return wgtypes.AWG20, nil
+	case "3", "3.0":
+		return wgtypes.AWG30, nil
+	case "3.1":
+		return wgtypes.AWG31, nil
+	default:
+		return wgtypes.AWGNone, fmt.Errorf("invalid --awg-version %q (valid values: 1.5, 2.0, 3.0, 3.1)", s)
+	}
 }
 
 func derefRange(p *wgtypes.UintRange) wgtypes.UintRange {
@@ -1673,7 +1739,11 @@ func storedAmnezVersion() wgtypes.AmneziaVersion {
 // change nothing; the accepted one leaves its test values behind, which is why
 // the caller forces a full sync immediately afterwards. No private key is
 // sent, so a probe can never disturb an existing tunnel identity.
-func probeAmneziaVersion(iface string) wgtypes.AmneziaVersion {
+func probeAmneziaVersion(iface string, maxVer wgtypes.AmneziaVersion) wgtypes.AmneziaVersion {
+	if maxVer <= wgtypes.AWG15 {
+		return wgtypes.AWG15
+	}
+
 	h1, h2, h3, h4 := "1000000-2000000", "3000000-4000000", "5000000-6000000", "7000000-8000000"
 	s1, s2, s3, s4 := 16, 17, 18, 19
 	trueVal := true
@@ -1692,6 +1762,9 @@ func probeAmneziaVersion(iface string) wgtypes.AmneziaVersion {
 	if err := wgClient.ConfigureDevice(iface, cfg); err != nil {
 		return wgtypes.AWG15
 	}
+	if maxVer <= wgtypes.AWG20 {
+		return wgtypes.AWG20
+	}
 
 	// 3.0 adds header protection and content padding. Paddings must stay at or
 	// above the header protection nonce or a 3.0 daemon rejects them.
@@ -1699,6 +1772,9 @@ func probeAmneziaVersion(iface string) wgtypes.AmneziaVersion {
 	cfg.ContentPaddingAddition = &cp
 	if err := wgClient.ConfigureDevice(iface, cfg); err != nil {
 		return wgtypes.AWG20
+	}
+	if maxVer <= wgtypes.AWG30 {
+		return wgtypes.AWG30
 	}
 
 	// 3.1 adds the two booleans.

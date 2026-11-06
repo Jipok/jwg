@@ -17,7 +17,7 @@ _jwg() {
     _init_completion || return
 
     local commands="add del rm show"
-    local flags="--ip --port --iface --endpoint --subnet --nat-iface --dns --client-allowed-ips --db --i1 --help"
+    local flags="--ip --port --iface --endpoint --subnet --nat-iface --dns --client-allowed-ips --db --blocklist --i1 --awg-version --help"
 
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
     local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -31,8 +31,12 @@ _jwg() {
             COMPREPLY=( $(compgen -W "$(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$')" -- "$cur") )
             return 0
             ;;
-        --db)
+        --db|--blocklist)
             _filedir
+            return 0
+            ;;
+        --awg-version)
+            COMPREPLY=( $(compgen -W "1.5 2.0 3.0 3.1" -- "$cur") )
             return 0
             ;;
         --port|--endpoint|--subnet|--dns|--client-allowed-ips|--ip|--i1)

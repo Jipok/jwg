@@ -101,6 +101,7 @@ jwg --subnet "192.168.100.1/24"
 *   `--nat-iface <name>`: Manually specify the public interface for NAT (default: auto-detected).
 *   `--client-allowed-ips <CIDR>`: Set specific `AllowedIPs` generated inside client configs (default: `0.0.0.0/0`).
 *   `--db <path>`: Check/Store the database in a custom path (defaults to `./jwg.db`, then `/var/lib/jwg/jwg.db`).
+*   `--awg-version <1.5|2.0|3.0|3.1>`: AmneziaWG obfuscation profile version to generate when initializing a new database (default: `2.0`).
 *   `--blocklist <path>`: Path to a plain-text file with IPs/CIDRs to drop server-side via nftables.
 
 💡 **Geo-blocking to prevent VPN detection**
