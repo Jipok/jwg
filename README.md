@@ -85,22 +85,6 @@ sudo systemctl restart jwg-dns.service
 sudo jwg show phone --split
 ```
 
-<details>
-<summary><b>Void Linux / runit service for jwg serve</b> (Click to expand)</summary>
-
-Create `/etc/sv/jwg-dns/run`:
-```sh
-#!/bin/sh
-exec 2>&1
-until ip -4 addr show dev awg0 2>/dev/null | grep -q '10.8.0.1/'; do sleep 1; done
-exec jwg --db /var/lib/jwg/jwg.db serve
-```
-```bash
-chmod +x /etc/sv/jwg-dns/run
-ln -s /etc/sv/jwg-dns /var/service/
-```
-</details>
-
 ---
 
 ## 📖 Command Reference
@@ -174,11 +158,17 @@ chmod +x void-infect.sh
 ```bash
 xbps-install jwg
 
-# Run the setup wizard first; jwg creates awg0 automatically
+# Download split-tunnel lists and RU IPv4 blocklist
+wget -qO /var/lib/jwg/proxy.lst https://github.com/1andrevich/Re-filter-lists/raw/refs/heads/main/domains_all.lst
+wget -qO /var/lib/jwg/ips.lst https://github.com/Jipok/dnsr/raw/refs/heads/master/ips.lst
+wget -qO /var/lib/jwg/RU_IPv4.txt https://country-ip-blocks.hackinggate.com/RU_IPv4.txt
+sed -i '/^178\.248\.23/d' /var/lib/jwg/RU_IPv4.txt
+
+# Run the setup wizard first; jwg creates awg0 and picks up RU_IPv4.txt automatically
 jwg
 
-# Then enable the runit service to restore the configured server after reboot
+# Enable the runit service (restores the tunnel and runs FakeIP DNS + stats)
 ln -s /etc/sv/jwg-awg0 /var/service/
 ```
 
-This gives you a pure, natively integrated WireGuard/AmneziaWG server running entirely in kernel space without systemd overhead. Just type `jwg add client` and you're good to go.
+This gives you a pure, natively integrated WireGuard/AmneziaWG server running entirely in kernel space without systemd overhead. Just type `jwg add client` (or `jwg add client --split`) and you're good to go.
