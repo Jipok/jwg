@@ -13,6 +13,7 @@ Crucially, it is compatible with **AmneziaWG-go**.
 ## ✨ Why jwg?
 
 *   **👻 AmneziaWG Ready:** Designed to work seamlessly with `amneziawg-go` and `wireguard-go` interfaces, not just kernel modules.
+*   **🎯 Server-Side Split Tunneling:** Route only blocked domains through the VPN (FakeIP + kernel `nftables` DNAT) while domestic traffic goes direct—works even on iOS and simple clients.
 *   **🚫 No Web UI Needed:** Forget about `docker-compose`, databases, or opening HTTP ports.
 *   **🔋 Battery Included:** Handles **NAT**, **Packet Forwarding**, Anti-Bufferbloat (Smart QoS), and **Firewall** (nftables & UFW) automatically. You don't need to be a Linux network engineer to set this up.
 *   **📱 QR Codes in Terminal:** Generate configs and display QR codes directly in the console.
@@ -25,7 +26,7 @@ Crucially, it is compatible with **AmneziaWG-go**.
 ### 1. Installation
 
 **Recommended: Automatic Installation**  
-Installs the required binaries, sets up a systemd service for AmneziaWG, and starts the VPN automatically.
+Installs the required binaries, preset domain/IP lists (`proxy.lst`, `ips.lst`, `RU_IPv4.txt`), sets up systemd services for AmneziaWG and FakeIP DNS, and starts the VPN automatically.
 ```bash
 curl -sL https://raw.githubusercontent.com/Jipok/jwg/master/install.sh | sudo bash
 ```
@@ -33,17 +34,13 @@ curl -sL https://raw.githubusercontent.com/Jipok/jwg/master/install.sh | sudo ba
 <details>
 <summary><b>Alternative: Manual / Wireguard Setup</b> (Click to expand)</summary>
 
-`jwg` manages the *configuration logic*, but you need to run the interface process first.
+`jwg` creates a missing kernel interface automatically: `awg0` for AmneziaWG when its module is available, otherwise `wg0` for WireGuard. Install the module and headers matching your **running kernel** first.
 
-**Start the Interface (choose one):**
+For a **userspace** backend, start its daemon before running `jwg`:
 ```bash
-# Option 1: AmneziaWG (Userspace Go daemon)
 wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go
 chmod +x amneziawg-go
 ./amneziawg-go wg0
-
-# Option 2: Standard Kernel WireGuard
-ip link add dev wg0 type wireguard
 ```
 
 **Initialize JWG Server:**
@@ -59,9 +56,50 @@ chmod +x jwg
 Once installed and running, just add a new peer. `jwg` will find the next available IP, generate keys, and sync the interface on the fly.
 
 ```bash
-jwg -add phone
+jwg add phone           # Full tunnel (all traffic via VPN)
+jwg add phone --split   # Split tunnel (only domains from proxy.lst + IPs from ips.lst)
 ```
 *The output matches the standard client config format and includes a QR code right in your terminal.*
+
+---
+
+## 🎯 Server-Side Split Tunneling (FakeIP)
+
+Standard WireGuard clients (especially on iOS) don't support domain-based routing. `jwg serve` solves this on the server side without Docker or userspace proxies:
+
+1. The client uses the VPN server (`10.8.0.1`) as its DNS and routes only `198.18.0.0/15` + `ips.lst` into the tunnel.
+2. Normal domains resolve to their **real IPs** and go directly through the ISP.
+3. Domains matching `/var/lib/jwg/proxy.lst` (including via CNAME chains) resolve to a virtual IP from `198.18.0.0/15`, which the Linux kernel transparently DNATs back to the real IP inside `nftables`.
+
+Full-tunnel and `--split` clients can coexist on the same interface.
+
+```bash
+# Update domain & IP lists manually
+sudo wget -qO /var/lib/jwg/proxy.lst https://github.com/1andrevich/Re-filter-lists/raw/refs/heads/main/domains_all.lst
+sudo wget -qO /var/lib/jwg/ips.lst https://github.com/Jipok/dnsr/raw/refs/heads/master/ips.lst
+
+# Restart the FakeIP DNS & stats daemon to reload proxy.lst (systemd)
+sudo systemctl restart jwg-dns.service
+
+# Export a split-tunnel config for an existing peer
+sudo jwg show phone --split
+```
+
+<details>
+<summary><b>Void Linux / runit service for jwg serve</b> (Click to expand)</summary>
+
+Create `/etc/sv/jwg-dns/run`:
+```sh
+#!/bin/sh
+exec 2>&1
+until ip -4 addr show dev awg0 2>/dev/null | grep -q '10.8.0.1/'; do sleep 1; done
+exec jwg --db /var/lib/jwg/jwg.db serve
+```
+```bash
+chmod +x /etc/sv/jwg-dns/run
+ln -s /etc/sv/jwg-dns /var/service/
+```
+</details>
 
 ---
 
@@ -71,9 +109,10 @@ jwg -add phone
 
 | Command | Description |
 | :--- | :--- |
-| `jwg add <name>` | Add a new peer. Auto-assigns the next available IP. |
+| `jwg add <name> [--split]` | Add a new peer (optional `--split` for FakeIP split-tunnel config). |
 | `jwg del <name>` *(or `rm`)*| Delete an existing peer. |
-| `jwg show <name>` | Display config and QR code for an existing peer. |
+| `jwg show <name> [--split]` | Display config and QR code for an existing peer. |
+| `jwg serve` | Run the FakeIP DNS mapper (`198.18.0.0/15`, `/var/lib/jwg/proxy.lst`) and traffic stats daemon. |
 | `jwg` | Show live server status, interface details, and list of connected peers. |
 
 ### Configuration Flags
@@ -133,10 +172,12 @@ chmod +x void-infect.sh
 
 **2. Install kernel AmneziaWG and JWG:**
 ```bash
-# Install kernel headers, the DKMS module, and jwg
-xbps-install linux-lts-headers jwg
+xbps-install jwg
 
-# Enable the runit service
+# Run the setup wizard first; jwg creates awg0 automatically
+jwg
+
+# Then enable the runit service to restore the configured server after reboot
 ln -s /etc/sv/jwg-awg0 /var/service/
 ```
 

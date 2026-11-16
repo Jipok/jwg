@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -12,9 +13,12 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Jipok/go-persist"
@@ -22,6 +26,7 @@ import (
 	"github.com/Jipok/wgctrl-go/wgtypes"
 	"github.com/skip2/go-qrcode"
 	"github.com/spf13/pflag"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -71,6 +76,11 @@ var (
 	argAmnezI1          string
 	argAmnezVersion     string
 	argBlockFile        string
+	argSplit            bool
+	argProxyList        string
+	argFakeCIDR         string
+	argUpstreamDNS      string
+	argDNSListen        string
 )
 
 // Persistent configuration
@@ -83,6 +93,8 @@ type ServerConfig struct {
 	DNS              string
 	ClientAllowedIPs string
 	Interface        string
+	Backend          string
+	AutoCreateIface  bool
 	BlockFile        string
 
 	// --- AmneziaWG Specific Params ---
@@ -147,18 +159,40 @@ func main() {
 	pflag.StringVar(&argBlockFile, "blocklist", "", "Optional: Path to a file containing CIDR subnets/IPs to block")
 	pflag.StringVar(&argAmnezI1, "i1", "", "AmneziaWG I1 parameter (custom init packet magic, e.g. for protocol emulation)")
 	pflag.StringVar(&argAmnezVersion, "awg-version", "", "AmneziaWG profile version to generate (1.5, 2.0, 3.0, 3.1; default: 2.0)")
+	pflag.BoolVar(&argSplit, "split", false, "Generate split-tunnel client config (FakeIP 198.18.0.0/15 + tunnel DNS + ips.lst)")
+	pflag.StringVar(&argProxyList, "proxy-list", "", "Path to domain list for 'serve' (default: <db-dir>/proxy.lst)")
+	pflag.StringVar(&argFakeCIDR, "fake-cidr", defaultFakeCIDR, "FakeIP CIDR pool for 'serve' and '--split'")
+	pflag.StringVar(&argUpstreamDNS, "upstream-dns", defaultUpstreamDNS, "Upstream DNS server(s) for 'serve'")
+	pflag.StringVar(&argDNSListen, "dns-listen", "", "DNS listen address:port for 'serve' (default: <server-tunnel-ip>:53)")
 
 	pflag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [command] [flags]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Commands:\n")
-		fmt.Fprintf(os.Stderr, "  add <peer>    Add a new peer\n")
-		fmt.Fprintf(os.Stderr, "  del <peer>    Delete an existing peer\n")
-		fmt.Fprintf(os.Stderr, "  show <peer>   Show config and QR code for a peer\n")
-		fmt.Fprintf(os.Stderr, "  <none>        Sync server configuration and show status\n\n")
-		fmt.Fprintf(os.Stderr, "Flags:\n")
-		pflag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nBlocklist example (drop RU traffic to prevent server IP leaks):\n")
-		fmt.Fprintf(os.Stderr, "  wget -qO /var/lib/jwg/RU_IPv4.txt https://country-ip-blocks.hackinggate.com/RU_IPv4.txt && sed -i '/^178\\.248\\.23/d' /var/lib/jwg/RU_IPv4.txt && jwg --blocklist /var/lib/jwg/RU_IPv4.txt\n")
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  jwg                       Sync server and show status, peers and traffic\n")
+		fmt.Fprintf(os.Stderr, "  jwg add <peer> [--split]  Add a new peer and print config + QR code\n")
+		fmt.Fprintf(os.Stderr, "  jwg show <peer> [--split] Show config + QR code for an existing peer\n")
+		fmt.Fprintf(os.Stderr, "  jwg del <peer>            Delete an existing peer\n")
+		fmt.Fprintf(os.Stderr, "  jwg serve                 Run FakeIP DNS mapper & traffic stats daemon\n\n")
+		fmt.Fprintf(os.Stderr, "Common options:\n")
+		fmt.Fprintf(os.Stderr, "  --split                   Generate split-tunnel config (FakeIP DNS + /var/lib/jwg/ips.lst)\n")
+		fmt.Fprintf(os.Stderr, "  --ip <addr>               Assign specific IPv4 to a new peer (with 'add')\n")
+		fmt.Fprintf(os.Stderr, "  --db <path>               Path to database file (default: /var/lib/jwg/jwg.db)\n\n")
+		fmt.Fprintf(os.Stderr, "Daemon options (for 'jwg serve'):\n")
+		fmt.Fprintf(os.Stderr, "  --iface <name>            Tunnel interface to serve (default: wg0)\n")
+		fmt.Fprintf(os.Stderr, "  --proxy-list <path>       Domain list file (default: <db-dir>/proxy.lst)\n")
+		fmt.Fprintf(os.Stderr, "  --fake-cidr <cidr>        FakeIP CIDR pool (default: 198.18.0.0/15)\n")
+		fmt.Fprintf(os.Stderr, "  --upstream-dns <ip:port>  Upstream DNS server (default: 1.1.1.1:53)\n")
+		fmt.Fprintf(os.Stderr, "  --dns-listen <ip:port>    DNS listen address (default: <tunnel-ip>:53)\n\n")
+		fmt.Fprintf(os.Stderr, "Server setup / DB override flags (prompted interactively on first run):\n")
+		fmt.Fprintf(os.Stderr, "  --iface <name>            WireGuard/AmneziaWG interface name (default: wg0)\n")
+		fmt.Fprintf(os.Stderr, "  --port <port>             Server UDP listen port (random free port on first run)\n")
+		fmt.Fprintf(os.Stderr, "  --subnet <cidr>           Tunnel IPv4 subnet (default: 10.8.0.1/24)\n")
+		fmt.Fprintf(os.Stderr, "  --endpoint <host[:port]>  Public server endpoint IP or domain (empty to reset)\n")
+		fmt.Fprintf(os.Stderr, "  --nat-iface <name>        Outbound interface for NAT (auto-detected if empty)\n")
+		fmt.Fprintf(os.Stderr, "  --blocklist <path>        File with outbound CIDRs/IPs to block (empty to disable)\n")
+		fmt.Fprintf(os.Stderr, "  --dns <ips>               DNS for full-tunnel configs (default: 1.1.1.1, 1.0.0.1)\n")
+		fmt.Fprintf(os.Stderr, "  --client-allowed-ips      AllowedIPs for full-tunnel configs (default: 0.0.0.0/0)\n")
+		fmt.Fprintf(os.Stderr, "  --awg-version <ver>       AmneziaWG version: 1.5, 2.0, 3.0, 3.1 (default: 2.0)\n")
+		fmt.Fprintf(os.Stderr, "  --i1 <tag>                Custom AmneziaWG I1 init packet signature\n")
 	}
 
 	pflag.Parse()
@@ -186,8 +220,9 @@ func main() {
 	case "":
 		// Default sync/info mode
 	case "list":
+	case "serve":
 	default:
-		log.Fatalf("%s[ERR]%s Unknown command '%s'. Valid commands are: add, del, show", colorRed, colorReset, command)
+		log.Fatalf("%s[ERR]%s Unknown command '%s'. Valid commands are: add, del, show, serve", colorRed, colorReset, command)
 	}
 
 	if os.Geteuid() != 0 {
@@ -200,6 +235,32 @@ func main() {
 	}
 	if _, err := exec.LookPath("ip"); err != nil {
 		log.Fatalf("%s[ERR]%s 'ip' command not found. Please install iproute2 (e.g., apt install iproute2).", colorRed, colorReset)
+	}
+
+	// 'serve' reads interface/subnet from jwg.db (if present) and closes it immediately without Shrink()
+	if command == "serve" {
+		dbPath := resolveDBPath(argDBPath)
+		if _, err := os.Stat(dbPath); err == nil {
+			s := persist.New()
+			if err := s.Open(dbPath); err == nil {
+				if cfg, err := persist.Get[ServerConfig](s, dbMapKeyServerConfig); err == nil {
+					if !isFlagPassed("iface") && cfg.Interface != "" {
+						argIface = cfg.Interface
+					}
+					if !isFlagPassed("subnet") && cfg.Subnet != "" {
+						argSubnet = cfg.Subnet
+					}
+				} else if err == persist.ErrKeyNotFound && !isFlagPassed("iface") {
+					_ = s.Close()
+					log.Fatalf("%s[ERR]%s Server is not initialized yet (%s). Run 'jwg' first.", colorRed, colorReset, dbPath)
+				}
+				_ = s.Close()
+			}
+		} else if !isFlagPassed("iface") {
+			log.Fatalf("%s[ERR]%s Server database not found at %s. Run 'jwg' first.", colorRed, colorReset, dbPath)
+		}
+		runServeDaemon(argIface, argDNSListen, argFakeCIDR, argUpstreamDNS, argProxyList)
+		return
 	}
 
 	if argPeerIP != "" && command != "add" {
@@ -218,6 +279,14 @@ func main() {
 	// --- Persistence/Config Logic ---
 
 	dbPath := resolveDBPath(argDBPath)
+	if _, err := os.Stat(dbPath); err != nil {
+		if command == "list" {
+			return
+		}
+		if command == "show" || command == "del" || command == "rm" {
+			log.Fatalf("%s[ERR]%s Server database not found at %s. Run 'jwg' first.", colorRed, colorReset, dbPath)
+		}
+	}
 	if command != "list" {
 		fmt.Printf("%s[INFO]%s Using database: %s\n", colorCyan, colorReset, dbPath)
 	}
@@ -234,25 +303,49 @@ func main() {
 		log.Fatalf("failed to create peers map: %v", err)
 	}
 
-	if err = store.Open(dbPath); err != nil {
-		log.Fatalf("failed to open persistence store: %v", err)
-	}
-	defer store.Close()
+	isFreshInstall := true
+	storeOpened := false
+	if _, statErr := os.Stat(dbPath); statErr == nil {
+		if err = store.Open(dbPath); err != nil {
+			log.Fatalf("failed to open persistence store: %v", err)
+		}
+		storeOpened = true
 
-	if err = store.Shrink(); err != nil {
-		log.Fatalf("failed to shrink store: %v", err)
-	}
+		if command != "list" && command != "show" {
+			if err = store.Shrink(); err != nil {
+				_ = store.Close()
+				log.Fatalf("failed to shrink store: %v", err)
+			}
+		}
 
-	config, err = persist.Get[ServerConfig](store, dbMapKeyServerConfig)
-	if err != nil && err != persist.ErrKeyNotFound {
-		log.Fatalf("failed to read server config map: %v", err)
+		config, err = persist.Get[ServerConfig](store, dbMapKeyServerConfig)
+		if err != nil && err != persist.ErrKeyNotFound {
+			_ = store.Close()
+			log.Fatalf("failed to read server config map: %v", err)
+		}
+		isFreshInstall = (err == persist.ErrKeyNotFound)
+
+		// If the file only contains an empty WAL header from an aborted run,
+		// close and remove it so it does not masquerade as an initialized DB.
+		if isFreshInstall && peerDataMap.Size() == 0 && command != "list" {
+			_ = store.Close()
+			_ = os.Remove(dbPath)
+			storeOpened = false
+		}
 	}
+	defer func() {
+		if storeOpened {
+			_ = store.Close()
+		}
+	}()
 
 	if command == "list" {
-		peerDataMap.Range(func(key string, peer PeerData) bool {
-			fmt.Println(key)
-			return true
-		})
+		if storeOpened {
+			peerDataMap.Range(func(key string, peer PeerData) bool {
+				fmt.Println(key)
+				return true
+			})
+		}
 		return
 	}
 
@@ -261,7 +354,15 @@ func main() {
 	// Flag to track if we need to re-apply firewall rules (port or nat-iface changed)
 	firewallDirty := false
 
-	if err == persist.ErrKeyNotFound {
+	if isFreshInstall {
+		if command == "show" || command == "del" || command == "rm" {
+			log.Fatalf("%s[ERR]%s Server is not initialized yet (%s). Run 'jwg' first.", colorRed, colorReset, dbPath)
+		}
+		if !isInteractiveTerminal() && !hasAnyServerSetupFlags() {
+			if existName, _, _ := detectExistingTunnelInterface(); existName == "" {
+				log.Fatalf("%s[ERR]%s Server is not initialized yet (%s). Run 'jwg' in an interactive terminal first.", colorRed, colorReset, dbPath)
+			}
+		}
 		fmt.Printf("%s[INFO]%s Server config not found. Generating a new one...\n", colorCyan, colorReset)
 		privateKey, err := wgtypes.GeneratePrivateKey()
 		if err != nil {
@@ -274,12 +375,14 @@ func main() {
 	// --- Configuration Normalization Logic ---
 	// Apply defaults to the Config struct if fields are empty (fresh install)
 	if config.Interface == "" {
-		config.Interface = defaultIface
+		config.Interface = defaultTunnelInterface()
 	}
 	if config.Port == 0 {
 		config.Port = getFreeUDPPort()
 		configDirty = true
-		fmt.Printf("%s[INFO]%s Auto-assigned random port: %d\n", colorCyan, colorReset, config.Port)
+		if !isFreshInstall || !isInteractiveTerminal() {
+			fmt.Printf("%s[INFO]%s Auto-assigned random port: %d\n", colorCyan, colorReset, config.Port)
+		}
 	}
 	if config.Subnet == "" {
 		config.Subnet = defaultSubnet
@@ -289,6 +392,16 @@ func main() {
 	}
 	if config.ClientAllowedIPs == "" {
 		config.ClientAllowedIPs = defaultClientAllowedIPs
+	}
+	if isFreshInstall && config.BlockFile == "" {
+		defaultBlock := filepath.Join(filepath.Dir(dbPath), "RU_IPv4.txt")
+		if _, err := os.Stat(defaultBlock); err == nil {
+			config.BlockFile = defaultBlock
+			configDirty = true
+		}
+	}
+	if isFreshInstall && isInteractiveTerminal() && !hasAnyServerSetupFlags() {
+		runFirstTimeSetupWizard(&config, dbPath)
 	}
 	oldPort := 0
 
@@ -351,7 +464,7 @@ func main() {
 		} else {
 			_, _, err := net.SplitHostPort(argEndpoint)
 			if err != nil { // Empty port
-				argEndpoint = net.JoinHostPort(argEndpoint, fmt.Sprintf("%d", argPort))
+				argEndpoint = net.JoinHostPort(argEndpoint, fmt.Sprintf("%d", config.Port))
 			}
 			config.Endpoint = argEndpoint
 			configDirty = true
@@ -388,8 +501,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Interface validation
-	if _, err := net.InterfaceByName(argIface); err != nil {
+	// Read-only exports must never create an interface.
+	if command == "show" {
+		if _, err := net.InterfaceByName(argIface); err != nil {
+			printMissingInterfaceHelp(argIface)
+			os.Exit(1)
+		}
+	}
+	if inferLegacyBackend(&config) {
+		configDirty = true
+	}
+	if err := ensureConfigInterface(&config); err != nil {
+		fmt.Printf("%s[ERR]%s %v\n", colorRed, colorReset, err)
 		printMissingInterfaceHelp(argIface)
 		os.Exit(1)
 	}
@@ -541,6 +664,17 @@ func main() {
 	}
 
 	// Save config if any values changed
+	if !storeOpened {
+		store = persist.New()
+		peerDataMap, err = persist.Map[PeerData](store, dbMapPeers)
+		if err != nil {
+			log.Fatalf("failed to create peers map: %v", err)
+		}
+		if err = store.Open(dbPath); err != nil {
+			log.Fatalf("failed to open persistence store: %v", err)
+		}
+		storeOpened = true
+	}
 	if configDirty {
 		if err := store.Set(dbMapKeyServerConfig, config); err != nil {
 			log.Fatalf("Failed to save server config: %v", err)
@@ -570,9 +704,9 @@ func main() {
 		runDelPeer(peerName)
 	}
 
-	mutatingAction := command == "add" || command == "del" || command == "rm"
+	mutatingAction := command == "add" || command == "del" || command == "rm" || isFlagPassed("i1")
 
-	// A successful probe leaves its test values on the device, so a full sync must follow to overwrite them with the real profile
+	// A successful probe leaves test values on the device; overwrite them with the stored profile.
 	if probed {
 		mutatingAction = true
 	}
@@ -607,7 +741,7 @@ func main() {
 	// Check environment and configure firewall/interfaces
 	if !isInterfaceConfigured(argIface, argSubnet) {
 		fmt.Printf("%s[WARN]%s Interface %s is not configured with IP %s. Running initial network setup...\n", colorYellow, colorReset, argIface, argSubnet)
-		// This runs full setup: IP assignment + UP + Firewall
+		// Assign the server address and apply network/firewall configuration.
 		runInitialNetworkSetup(oldPort)
 		mutatingAction = true
 	} else if firewallDirty {
@@ -626,45 +760,27 @@ func main() {
 		checkAndConfigureUFW(oldPort, argPort, argIface, argNatIface)
 
 		fmt.Printf("%s[OK]%s Firewall rules updated for port %d.\n", colorGreen, colorReset, argPort)
-		mutatingAction = true // Force WG sync to bind to new port
 	}
 
-	// Safety check: even if user didn't ask to add/del peer, and IP is set,
-	// checking if the running interface actually matches our desired config (Port/Keys).
-	if !mutatingAction {
-		if d, err := wgClient.Device(argIface); err == nil {
-			if d.ListenPort != argPort {
-				fmt.Printf("%s[CONF]%s Live listen port (%d) mismatches config (%d).\n", colorYellow, colorReset, d.ListenPort, argPort)
-				mutatingAction = true
-			} else if d.PrivateKey != config.PrivateKey {
-				fmt.Printf("%s[CONF]%s Live private key mismatches database.\n", colorYellow, colorReset)
-				mutatingAction = true
-			} else if len(d.Peers) != peerDataMap.Size() {
-				fmt.Printf("%s[CONF]%s Live peer count (%d) mismatches database (%d).\n", colorYellow, colorReset, len(d.Peers), peerDataMap.Size())
-				mutatingAction = true
-			}
-		}
+	// Reconcile only changed peers; never reset sessions belonging to other clients.
+	live, err := wgClient.Device(argIface)
+	if err != nil {
+		log.Fatalf("Failed to read interface %s: %v", argIface, err)
 	}
+	var desired []wgtypes.PeerConfig
+	peerDataMap.Range(func(_ string, peer PeerData) bool {
+		desired = append(desired, peer.Config)
+		return true
+	})
+	changes := peerConfigChanges(desired, live.Peers)
+	mutatingAction = mutatingAction || live.ListenPort != argPort || live.PrivateKey != config.PrivateKey || len(changes) > 0
 
-	// --- Core Sync Logic ---
 	if mutatingAction {
-		fmt.Printf("\n%s[SYNC]%s Starting full sync for interface %s%s%s...\n", colorPurple, colorReset, colorBold, argIface, colorReset)
-
-		// Load all peers from the database.
-		allPeers := make([]wgtypes.PeerConfig, 0, peerDataMap.Size())
-		peerDataMap.Range(func(key string, peer PeerData) bool {
-			allPeers = append(allPeers, peer.Config)
-			return true // Continue iterating
-		})
-		fmt.Printf("  %s[DB]%s Found %d peers in the database to apply.\n", colorCyan, colorReset, len(allPeers))
-
-		// Create a complete configuration object and apply it.
-		// This replaces all existing peers on the interface with the list from our database.
+		fmt.Printf("\n%s[SYNC]%s Updating interface %s (%d peer changes)...\n", colorPurple, colorReset, argIface, len(changes))
 		configWg := wgtypes.Config{
-			PrivateKey:   &config.PrivateKey,
-			ListenPort:   &argPort,
-			ReplacePeers: true,
-			Peers:        allPeers,
+			PrivateKey: &config.PrivateKey,
+			ListenPort: &argPort,
+			Peers:      changes,
 		}
 
 		// Apply Amnezia-specific parameters only if the device supports it
@@ -728,12 +844,17 @@ func main() {
 			}
 			log.Fatalf("Failed to configure WireGuard device: %v", err)
 		}
-		fmt.Printf("  %s[OK]%s Synced interface %s with private key, listen port, and %d peers.\n", colorGreen, colorReset, argIface, len(allPeers))
+		fmt.Printf("  %s[OK]%s Synced interface %s with private key, listen port, and %d peers.\n", colorGreen, colorReset, argIface, len(desired))
 	}
 
 	// Only show final state if not mutating
 	if command == "" {
 		runShowInfo()
+	}
+	if isFreshInstall && isInteractiveTerminal() {
+		if _, err := os.Stat("/etc/sv/jwg-" + argIface + "/run"); err == nil {
+			fmt.Printf("\nSetup complete. Enable the Void service to restore this configuration after reboot:\n  ln -s /etc/sv/jwg-%s /var/service/\n", argIface)
+		}
 	}
 }
 
@@ -763,12 +884,16 @@ func detectDefaultInterface() (string, error) {
 
 func printMissingInterfaceHelp(ifaceName string) {
 	fmt.Printf("\n%s[ERROR]%s Network interface '%s%s%s' not found.\n", colorRed, colorReset, colorBold, ifaceName, colorReset)
-	fmt.Printf("This utility manages configuration, but the interface must be created first.\n\n")
+	fmt.Printf("Missing kernel interfaces are created automatically. For AmneziaWG, install the module and headers matching the running kernel.\n\n")
+	fmt.Printf("Kernel AmneziaWG: ip link add dev %s type amneziawg\n", ifaceName)
+	if _, err := os.Stat("/etc/sv/jwg-" + ifaceName + "/run"); err == nil {
+		fmt.Printf("After setup, enable the Void service for persistence: ln -s /etc/sv/jwg-%s /var/service/\n\n", ifaceName)
+	}
 
 	fmt.Printf("%sChoose your backend and start the interface:%s\n", colorBlue, colorReset)
 	fmt.Println("---------------------------------------------------------------")
 
-	fmt.Printf("%s1. AmneziaWG (Userspace)                         %s<- Recommended%s\n", colorGreen, colorBlue, colorReset)
+	fmt.Printf("%s1. AmneziaWG (Userspace fallback)%s\n", colorGreen, colorReset)
 	fmt.Printf("   If using the amneziawg-go version of wireguard-go:\n")
 	fmt.Printf("   %s#%s%s ./amneziawg-go -f %s%s\n", colorGreen, colorReset, colorBold, ifaceName, colorReset)
 	fmt.Println("   (This runs foreground. Keep it running or make a service)")
@@ -868,17 +993,19 @@ func applyNftablesRules(subnet, wgIface, natIface, blockFile string) error {
 	if blockFile != "" {
 		cidrs, err := parseBlockFile(blockFile)
 		if err != nil {
-			fmt.Printf("  %s[WARN]%s Failed to read block file '%s': %v\n", colorYellow, colorReset, blockFile, err)
-		} else if len(cidrs) > 0 {
-			fmt.Printf("  %s[FIREWALL]%s Loaded %d IPv4 subnets from block file.\n", colorCyan, colorReset, len(cidrs))
+			return fmt.Errorf("read blocklist %q: %w", blockFile, err)
+		}
+		if len(cidrs) == 0 {
+			return fmt.Errorf("blocklist %q contains no valid IPv4 addresses or subnets; use --blocklist \"\" to explicitly disable blocking", blockFile)
+		}
+		fmt.Printf("  %s[FIREWALL]%s Loaded %d IPv4 subnets from block file.\n", colorCyan, colorReset, len(cidrs))
 
-			blocklistScript = fmt.Sprintf(`
+		blocklistScript = fmt.Sprintf(`
 # GeoIP / Blocklist Rules
 add set ip %[1]s blocked_ips { type ipv4_addr; flags interval; auto-merge; }
 add element ip %[1]s blocked_ips { %[2]s }
 add rule ip %[1]s forward iifname "%[3]s" ip daddr @blocked_ips counter drop
 `, tableName, strings.Join(cidrs, ", "), wgIface)
-		}
 	}
 
 	// We use a priority of -5 for filter to try and run before standard firewalls (often 0)
@@ -897,6 +1024,10 @@ add table ip %[1]s
 # 2. Filter Chain (Forwarding)
 # Priority -5 ensures this runs slightly before default filter rules (usually 0)
 add chain ip %[1]s forward { type filter hook forward priority -5; policy accept; }
+
+# Clamp TCP MSS to tunnel PMTU to prevent large TLS/HTTP stalls
+add rule ip %[1]s forward iifname "%[2]s" tcp flags syn tcp option maxseg size set rt mtu
+add rule ip %[1]s forward oifname "%[2]s" tcp flags syn tcp option maxseg size set rt mtu
 
 # Blocklist Rules
 %[5]s
@@ -1008,6 +1139,14 @@ func checkAndConfigureUFW(oldPort, newPort int, wgIface, natIface string) {
 		fmt.Printf("    %s[WARN]%s Failed to add UFW route rule (internet might be blocked): %s\n", colorYellow, colorReset, string(out))
 	} else {
 		fmt.Printf("    - Rule ensured: route allow in on %s out on %s\n", wgIface, natIface)
+	}
+
+	// 4. Allow tunnel DNS queries to the server (for split-tunnel FakeIP DNS on port 53)
+	dnsCmd := exec.Command("ufw", "allow", "in", "on", wgIface, "to", "any", "port", "53")
+	if out, err := dnsCmd.CombinedOutput(); err != nil {
+		fmt.Printf("    %s[WARN]%s Failed to add UFW tunnel DNS rule: %s\n", colorYellow, colorReset, string(out))
+	} else {
+		fmt.Printf("    - Rule ensured: allow in on %s to any port 53\n", wgIface)
 	}
 }
 
@@ -1290,15 +1429,15 @@ func runAddPeer(peerName string) {
 		}
 
 		ipPrefix, err := netip.ParsePrefix(argPeerIP)
-		if err != nil {
-			log.Fatalf("Invalid format for --ip flag '%s': %v. Must be like '10.8.0.5'.", argPeerIP, err)
+		if err != nil || !ipPrefix.Addr().Is4() || ipPrefix.Bits() != 32 {
+			log.Fatalf("Invalid format for --ip flag '%s': must be an IPv4 /32 host address like '10.8.0.5'.", argPeerIP)
 		}
-		peerIP = argPeerIP
 		userIP := ipPrefix.Addr()
+		peerIP = userIP.String() + "/32"
 
 		serverPrefix, _ := netip.ParsePrefix(config.Subnet)
-		if !serverPrefix.Contains(userIP) {
-			log.Fatalf("Provided IP %s does not belong to server subnet %s", userIP, config.Subnet)
+		if !serverPrefix.Contains(userIP) || userIP == serverPrefix.Addr() || userIP == serverPrefix.Masked().Addr() || !serverPrefix.Contains(userIP.Next()) {
+			log.Fatalf("Provided IP %s does not belong to usable client range of %s", userIP, config.Subnet)
 		}
 
 		// Check if this IP is already in use.
@@ -1435,6 +1574,31 @@ func printClientConfig(peerName string, peerData PeerData, serverPublicKey wgtyp
 		}
 	}
 
+	clientDNS := config.DNS
+	clientAllowedIPs := config.ClientAllowedIPs
+	modeLabel := ""
+
+	if argSplit {
+		modeLabel = " (Split-Tunnel / FakeIP)"
+		serverTunnelIP := "10.8.0.1"
+		if pfx, err := netip.ParsePrefix(config.Subnet); err == nil && pfx.Addr().Is4() {
+			serverTunnelIP = pfx.Addr().String()
+		}
+		clientDNS = serverTunnelIP
+
+		fakeCIDR := argFakeCIDR
+		if fakeCIDR == "" {
+			fakeCIDR = defaultFakeCIDR
+		}
+		allowedList := []string{serverTunnelIP + "/32", fakeCIDR}
+
+		ipsFile := filepath.Join(stateDirPath(argDBPath), "ips.lst")
+		if cidrs, err := parseBlockFile(ipsFile); err == nil && len(cidrs) > 0 {
+			allowedList = append(allowedList, cidrs...)
+		}
+		clientAllowedIPs = strings.Join(allowedList, ", ")
+	}
+
 	clientConfig := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s
@@ -1449,15 +1613,15 @@ PersistentKeepalive = 25
 `,
 		peerData.PrivateKey.String(),
 		peerIP,
-		config.DNS,
+		clientDNS,
 		amneziaParamsBuilder.String(),
 		serverPublicKey.String(),
 		psk,
 		config.Endpoint,
-		config.ClientAllowedIPs,
+		clientAllowedIPs,
 	)
 
-	fmt.Printf("\n%s%s---------- Client Configuration for '%s' -----------%s\n", colorBlue, colorBold, peerName, colorReset)
+	fmt.Printf("\n%s%s---------- Client Configuration for '%s'%s -----------%s\n", colorBlue, colorBold, peerName, modeLabel, colorReset)
 	fmt.Println(clientConfig)
 	fmt.Printf("%s%s----------------------------------------------------%s\n", colorBlue, colorBold, colorReset)
 	fmt.Printf("\n%s%s--------- QR Code (for Mobile) ----------%s\n", colorBlue, colorBold, colorReset)
@@ -1488,6 +1652,15 @@ func runShowInfo() {
 		// This might happen if the interface doesn't exist yet. It's not a fatal error here.
 		fmt.Printf("%sCould not get live info for device '%s': %v%s\n", colorRed, argIface, err, colorReset)
 	} else {
+		stateDir := stateDirPath(argDBPath)
+		var sf *StatsFile
+		if _, err := os.Stat(statsFilePath(stateDir, d.Name)); err == nil {
+			sf, _ = LoadStatsFile(stateDir, d.Name)
+			if sf != nil {
+				UpdatePeerStatsSnapshot(sf, d.Peers, time.Now())
+			}
+		}
+
 		printDeviceDetails(d)
 
 		if len(d.Peers) == 0 {
@@ -1517,7 +1690,7 @@ func runShowInfo() {
 			fmt.Printf("  %sPeers (%d):%s\n", colorBold, len(d.Peers), colorReset)
 			for _, p := range d.Peers {
 				// Pass the lookup map to the print function
-				printPeerDetails(p, publicKeyToName)
+				printPeerDetails(p, publicKeyToName, sf)
 			}
 		}
 	}
@@ -1583,10 +1756,18 @@ func printDeviceDetails(d *wgtypes.Device) {
 	} else {
 		printInfo("Blocklist", colorYellow+"none (use --blocklist to prevent geo IP leaks)"+colorReset)
 	}
+
+	if liveMap, err := listNftFakeIPMap(d.Name); err == nil {
+		status := "not responding"
+		if tunnelDNSResponding(d.Name, config.Subnet) {
+			status = "responding"
+		}
+		printInfo("FakeIP DNS", fmt.Sprintf("%s (%d mapped IPs in @fakeip_dnat)", status, len(liveMap)))
+	}
 }
 
 // printPeerDetails prints all available fields for a wgtypes.Peer.
-func printPeerDetails(p wgtypes.Peer, publicKeyToName map[wgtypes.Key]string) {
+func printPeerDetails(p wgtypes.Peer, publicKeyToName map[wgtypes.Key]string, sf *StatsFile) {
 	// Look up the friendly name from the map.
 	peerName, ok := publicKeyToName[p.PublicKey]
 	if !ok {
@@ -1625,6 +1806,13 @@ func printPeerDetails(p wgtypes.Peer, publicKeyToName map[wgtypes.Key]string) {
 	printInfo("Last Handshake", handshakeStr)
 
 	printInfo("Transfer", fmt.Sprintf("%s received, %s sent", formatBytes(p.ReceiveBytes), formatBytes(p.TransmitBytes)))
+
+	if sf != nil {
+		if st, ok := sf.Peers[p.PublicKey.String()]; ok && (st.TotalRx+st.TotalTx) > 0 {
+			printInfo("Transfer (total)", fmt.Sprintf("%s received, %s sent (%s total)",
+				formatBytes(st.TotalRx), formatBytes(st.TotalTx), formatBytes(st.TotalRx+st.TotalTx)))
+		}
+	}
 
 	if p.PersistentKeepaliveInterval > 0 {
 		printInfo("Persistent Keepalive", p.PersistentKeepaliveInterval.String())
@@ -1736,8 +1924,8 @@ func storedAmnezVersion() wgtypes.AmneziaVersion {
 // It runs once on a fresh database, before anything is generated, and tries
 // the generations from the oldest up so that an old daemon is identified in a
 // single attempt. A rejected message is discarded wholesale, so those attempts
-// change nothing; the accepted one leaves its test values behind, which is why
-// the caller forces a full sync immediately afterwards. No private key is
+// change nothing; accepted probes leave test values behind, which is why
+// the caller reapplies the stored device profile immediately afterwards. No private key is
 // sent, so a probe can never disturb an existing tunnel identity.
 func probeAmneziaVersion(iface string, maxVer wgtypes.AmneziaVersion) wgtypes.AmneziaVersion {
 	if maxVer <= wgtypes.AWG15 {
@@ -1756,8 +1944,7 @@ func probeAmneziaVersion(iface string, maxVer wgtypes.AmneziaVersion) wgtypes.Am
 	cfg := wgtypes.Config{
 		S1: &s1, S2: &s2, S3: &s3, S4: &s4,
 		H1: &h1, H2: &h2, H3: &h3, H4: &h4,
-		I1:           strPtr("<r 4>"),
-		ReplacePeers: true,
+		I1: strPtr("<r 4>"),
 	}
 	if err := wgClient.ConfigureDevice(iface, cfg); err != nil {
 		return wgtypes.AWG15
@@ -1805,4 +1992,195 @@ func intPtr(i int) *int {
 
 func strPtr(s string) *string {
 	return &s
+}
+
+func isInteractiveTerminal() bool {
+	_, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS)
+	return err == nil
+}
+
+func hasAnyServerSetupFlags() bool {
+	for _, f := range []string{"iface", "port", "subnet", "nat-iface", "endpoint", "dns", "client-allowed-ips", "blocklist", "i1", "awg-version"} {
+		if isFlagPassed(f) {
+			return true
+		}
+	}
+	return false
+}
+
+func promptLine(reader *bufio.Reader, label, defVal string, onAbort ...func()) string {
+	if defVal != "" {
+		fmt.Printf("  %s%s%s [%s%s%s]: ", colorBold, label, colorReset, colorCyan, defVal, colorReset)
+	} else {
+		fmt.Printf("  %s%s%s: ", colorBold, label, colorReset)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		for _, fn := range onAbort {
+			if fn != nil {
+				fn()
+			}
+		}
+		fmt.Println()
+		log.Fatalf("%s[ERR]%s Setup aborted.", colorRed, colorReset)
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return defVal
+	}
+	return line
+}
+
+func runFirstTimeSetupWizard(cfg *ServerConfig, dbPath string) {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("\n%s====================================================%s\n", colorGreen, colorReset)
+	fmt.Printf("  %sJWG Initial Server Setup%s (%s)\n", colorBold, colorReset, dbPath)
+	fmt.Printf("  Press Enter to accept [%sdefault%s] values.\n", colorCyan, colorReset)
+	fmt.Printf("%s====================================================%s\n", colorGreen, colorReset)
+
+	existName, existUserspace, existAmnezia := detectExistingTunnelInterface()
+	hasKernelAWG := kernelModuleAvailable(backendAmneziaWG)
+	hasKernelWG := kernelModuleAvailable(backendWireGuard)
+
+	defaultChoice := "1"
+	switch {
+	case existName != "" && existUserspace:
+		defaultChoice = "3"
+	case existName != "" && !existUserspace && existAmnezia:
+		defaultChoice = "1"
+	case existName != "" && !existUserspace && !existAmnezia:
+		defaultChoice = "2"
+	case hasKernelAWG:
+		defaultChoice = "1"
+	case hasKernelWG:
+		defaultChoice = "2"
+	default:
+		defaultChoice = "3"
+	}
+
+	fmt.Printf("  %s1. Tunnel backend:%s\n", colorBold, colorReset)
+	fmt.Printf("     [%s1%s] AmneziaWG (Linux kernel module)\n", colorCyan, colorReset)
+	fmt.Printf("     [%s2%s] WireGuard (Linux kernel module)\n", colorCyan, colorReset)
+	fmt.Printf("     [%s3%s] Existing / Userspace interface (amneziawg-go / wireguard-go)\n", colorCyan, colorReset)
+
+	var defaultIfaceName string
+	for {
+		choice := strings.ToLower(promptLine(reader, "Select backend", defaultChoice))
+		switch choice {
+		case "1", "awg", "amnezia", "amneziawg":
+			cfg.Backend = backendAmneziaWG
+			cfg.AutoCreateIface = true
+			defaultIfaceName = "awg0"
+			if existName != "" && !existUserspace && existAmnezia {
+				defaultIfaceName = existName
+			}
+		case "2", "wg", "wireguard":
+			cfg.Backend = backendWireGuard
+			cfg.AutoCreateIface = true
+			defaultIfaceName = defaultIface
+			if existName != "" && !existUserspace && !existAmnezia {
+				defaultIfaceName = existName
+			}
+		case "3", "userspace", "existing":
+			cfg.Backend = backendUserspace
+			cfg.AutoCreateIface = false
+			defaultIfaceName = defaultIface
+			if existName != "" {
+				defaultIfaceName = existName
+			}
+		default:
+			fmt.Printf("  %s[ERR]%s Invalid choice (enter 1, 2, or 3)\n", colorRed, colorReset)
+			continue
+		}
+		break
+	}
+
+	cfg.Interface = promptLine(reader, "2. Tunnel interface", defaultIfaceName)
+	var cleanupIface func()
+	if cfg.AutoCreateIface {
+		created, err := createKernelInterface(cfg.Interface, cfg.Backend)
+		if err != nil {
+			fmt.Printf("%s[ERR]%s %v\n", colorRed, colorReset, err)
+			printMissingInterfaceHelp(cfg.Interface)
+			os.Exit(1)
+		}
+		if created {
+			ifaceToClean := cfg.Interface
+			cleanupIface = func() {
+				_ = exec.Command("ip", "link", "del", "dev", ifaceToClean).Run()
+			}
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(sigCh)
+			go func() {
+				if _, ok := <-sigCh; ok {
+					cleanupIface()
+					fmt.Println()
+					os.Exit(130)
+				}
+			}()
+			defer close(sigCh)
+		}
+	} else if _, err := net.InterfaceByName(cfg.Interface); err != nil {
+		printMissingInterfaceHelp(cfg.Interface)
+		os.Exit(1)
+	}
+
+	for {
+		portStr := promptLine(reader, "3. Listen UDP port", strconv.Itoa(cfg.Port), cleanupIface)
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
+			cfg.Port = p
+			break
+		}
+		fmt.Printf("  %s[ERR]%s Invalid UDP port (1..65535)\n", colorRed, colorReset)
+	}
+
+	for {
+		sub := promptLine(reader, "4. Tunnel subnet", cfg.Subnet, cleanupIface)
+		if pfx, err := netip.ParsePrefix(sub); err == nil && pfx.Addr().Is4() && pfx.Bits() <= 30 {
+			cfg.Subnet = sub
+			break
+		}
+		fmt.Printf("  %s[ERR]%s Invalid IPv4 CIDR (example: 10.8.0.1/24)\n", colorRed, colorReset)
+	}
+
+	autoIP, _ := detectPublicIP()
+	epDefault := "auto"
+	if autoIP != "" {
+		epDefault = "auto: " + autoIP
+	}
+	epInput := promptLine(reader, "5. Public endpoint (IP or domain)", epDefault, cleanupIface)
+	if epInput == "" || epInput == epDefault || epInput == "auto" {
+		if autoIP != "" {
+			cfg.Endpoint = net.JoinHostPort(autoIP, strconv.Itoa(cfg.Port))
+		}
+	} else {
+		if _, _, err := net.SplitHostPort(epInput); err != nil {
+			epInput = net.JoinHostPort(epInput, strconv.Itoa(cfg.Port))
+		}
+		cfg.Endpoint = epInput
+	}
+
+	natDefault, _ := detectDefaultInterface()
+	for {
+		cfg.NatIface = promptLine(reader, "6. Public NAT interface", natDefault, cleanupIface)
+		if cfg.NatIface != "" {
+			break
+		}
+		fmt.Printf("  %s[ERR]%s Please specify a public network interface (e.g., eth0)\n", colorRed, colorReset)
+	}
+
+	defaultBlock := filepath.Join(filepath.Dir(dbPath), "RU_IPv4.txt")
+	blockDefLabel := "none"
+	if _, err := os.Stat(defaultBlock); err == nil {
+		blockDefLabel = defaultBlock
+	}
+	blockInput := promptLine(reader, "7. Outbound IP blocklist file", blockDefLabel, cleanupIface)
+	if blockInput != "" && blockInput != "none" && blockInput != "-" {
+		cfg.BlockFile = blockInput
+	} else {
+		cfg.BlockFile = ""
+	}
+
+	fmt.Println()
 }

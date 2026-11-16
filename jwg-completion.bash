@@ -16,8 +16,8 @@ _jwg() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="add del rm show"
-    local flags="--ip --port --iface --endpoint --subnet --nat-iface --dns --client-allowed-ips --db --blocklist --i1 --awg-version --help"
+    local commands="add del rm show serve"
+    local flags="--split --ip --db --port --iface --endpoint --subnet --nat-iface --dns --client-allowed-ips --blocklist --i1 --awg-version --proxy-list --fake-cidr --upstream-dns --dns-listen --help"
 
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
     local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -31,7 +31,7 @@ _jwg() {
             COMPREPLY=( $(compgen -W "$(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$')" -- "$cur") )
             return 0
             ;;
-        --db|--blocklist)
+        --db|--blocklist|--proxy-list)
             _filedir
             return 0
             ;;
@@ -49,7 +49,7 @@ _jwg() {
     local i=0
 
     for word in "${COMP_WORDS[@]}"; do
-        if [[ "$word" == "add" || "$word" == "del" || "$word" == "rm" || "$word" == "show" ]]; then
+        if [[ "$word" == "add" || "$word" == "del" || "$word" == "rm" || "$word" == "show" || "$word" == "serve" ]]; then
             cmd="$word"
         elif [[ "$word" == "--db" ]]; then
             local next_i=$((i + 1))
